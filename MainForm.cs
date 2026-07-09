@@ -72,14 +72,7 @@ class MainForm : Form
     string? _placeholderText;
     readonly Dictionary<int, List<TestGroup>> _resultsByScenario = new();
 
-    static string SettingsPath
-    {
-        get
-        {
-            string? dir = Path.GetDirectoryName(Environment.ProcessPath);
-            return Path.Combine(dir ?? ".", "smb-diag-settings.json");
-        }
-    }
+    static string SettingsPath => Path.Combine(AppContext.BaseDirectory, "smb-diag-settings.json");
 
     public MainForm()
     {
@@ -113,12 +106,12 @@ class MainForm : Form
         var header = new Panel { Height = 34, Dock = DockStyle.Fill };
         header.Paint += (s, e) => e.Graphics.DrawLine(BorderPen, 0, header.Height - 1, header.Width, header.Height - 1);
         var lblTitle = new Label { Text = "SMB Auth Diagnostics", ForeColor = TextColor, Font = new Font("Segoe UI", 11f, FontStyle.Bold), AutoSize = true, Location = new Point(10, 6) };
-        var lblTag = new Label { Text = " v1.1 ", ForeColor = AccentColor, BackColor = AccentDimColor, Font = new Font("Segoe UI", 7.5f, FontStyle.Bold), AutoSize = true, Location = new Point(192, 10) };
+        var lblTag = new Label { Text = " v1.0.0 ", ForeColor = AccentColor, BackColor = AccentDimColor, Font = new Font("Segoe UI", 7.5f, FontStyle.Bold), AutoSize = true, Location = new Point(192, 10) };
         _cboScenario = new ComboBox
         {
             DropDownStyle = ComboBoxStyle.DropDownList,
             BackColor = SurfaceColor, ForeColor = TextColor,
-            FlatStyle = FlatStyle.Flat,
+            FlatStyle = FlatStyle.Standard,
             Font = new Font("Segoe UI", 8.5f),
             Location = new Point(240, 5),
         };
@@ -237,6 +230,7 @@ class MainForm : Form
         };
 
         LoadSettings();
+        FormClosing += (s, e) => SaveSettings();
     }
 
     ComboBox MakeInput(Panel parent, string label, int col, int row)
@@ -257,7 +251,7 @@ class MainForm : Form
             Text = "",
             DropDownStyle = ComboBoxStyle.DropDown,
             BackColor = SurfaceColor, ForeColor = TextColor,
-            FlatStyle = FlatStyle.Flat,
+            FlatStyle = FlatStyle.Standard,
             Font = new Font("Cascadia Code", 9f),
             Location = new Point(x, y + 13), Width = w,
         };
