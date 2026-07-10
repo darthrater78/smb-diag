@@ -15,12 +15,12 @@ On first launch, Windows SmartScreen may display a warning ("Windows protected y
 1. Launch `smb-diag.exe`
 2. The app auto-detects your device join type (AD or Entra) on startup via `dsregcmd /status`
 3. Enter target details:
-   - **File Server (FQDN)** — e.g. `fileserver.contoso.com`
+   - **File Server** — hostname or FQDN (e.g. `files` or `files.contoso.com`). Check **+ domain suffix** to auto-append the domain.
    - **Domain** — e.g. `contoso.com`
-   - **DC Hostname** — optional, defaults to domain for KDC lookups
+   - **DC Hostname** — optional, defaults to domain for KDC lookups. Check **+ domain suffix** to auto-append the domain.
    - **Share Path** — optional share name for access test (e.g. `shared$`)
 4. Click **Run Diagnostics** — results stream in as each test group completes
-5. Review results or switch to the **Guide** tab for explanations and troubleshooting tips
+5. Review results or switch to the **Guide** tab for explanations, or **Kerberos Tickets** tab for live ticket cache and PRT status
 
 Input fields remember previously entered values in a dropdown. Up to 5 diagnostic runs are stored per scenario with timestamps — click any run to review it, or **Delete Run** to remove it.
 
@@ -35,7 +35,7 @@ Input fields remember previously entered values in a dropdown. Up to 5 diagnosti
 This tool is **read-only and diagnostic**. It does not store, transmit, or log any credentials, tokens, or secrets.
 
 - **SSPI token buffers are zeroed before freeing.** The Negotiate and NTLM token buffers allocated via `Marshal.AllocHGlobal` are explicitly cleared (`Span<byte>.Clear()`) before being freed, preventing auth tokens from lingering in heap memory.
-- **No credentials are written to disk.** The settings file (`smb-diag-settings.json`) contains only input field history (hostnames) and scenario selection — never credentials, tokens, or ticket data.
+- **No credentials are written to disk.** The settings file (`%LOCALAPPDATA%\smb-diag\settings.json`) contains only input field history (hostnames) and scenario selection — never credentials, tokens, or ticket data.
 - **Exported reports contain only metadata.** The text export includes test names and diagnostic details (ticket names, expiry times, encryption types, port status). No raw tokens, password hashes, or credential material is included.
 - **External process output is not persisted.** Output from `dsregcmd`, `klist`, `cmdkey`, and other tools is parsed in memory for specific values only. The raw output is never written to disk or stored beyond the method scope.
 - **`net use` connections are immediately cleaned up.** The Share Access Test creates a temporary connection and deletes it (`net use /delete`) immediately after the test.
@@ -132,7 +132,7 @@ Tests connectivity to services required for SMB authentication. Port checks run 
 
 ## Architecture
 
-**Runtime:** .NET 8 WinForms, self-contained single-file executable (win-x64, ~63 MB).
+**Runtime:** .NET 8 WinForms, self-contained single-file executable (win-x64, ReadyToRun AOT, ~63 MB).
 
 **Structure:** Single-file app (`MainForm.cs`). All UI, diagnostics, and SSPI interop in one compilation unit.
 
@@ -144,15 +144,15 @@ Tests connectivity to services required for SMB authentication. Port checks run 
 - `HostnamePattern`: `^[a-zA-Z0-9.\-]+$` — server, domain, DC fields
 - `ShareNamePattern`: `^[a-zA-Z0-9_\-$.]+$` — share name field
 
-**Settings:** `smb-diag-settings.json` stored next to the exe via `AppContext.BaseDirectory`. Contains input history only — no credentials.
+**Settings:** `%LOCALAPPDATA%\smb-diag\settings.json`. Contains input history and UI state only — no credentials. Persists across exe updates.
 
 ### External Process Calls
 
 | Process | Purpose | Timeout |
 |---|---|---|
 | `dsregcmd /status` | Device join state | 5s |
-| `klist` | Kerberos ticket cache | 15s |
-| `klist purge` | Clear ticket cache | 15s |
+| `klist` | Kerberos ticket cache | 15s (diag), 5s (Tickets tab) |
+| `klist purge` | Clear ticket cache (Tickets tab only) | 5s |
 | `setspn -Q` | SPN lookup in AD | 5s |
 | `nslookup -type=SRV` | Kerberos DNS discovery | 5s |
 | `w32tm /stripchart` | Clock skew measurement | 5s |
@@ -179,5 +179,6 @@ Output: `bin/Release/net8.0-windows/win-x64/publish/smb-diag.exe`
 
 | Version | Date | Changes |
 |---|---|---|
-| v1.1.0 | 2026-07-10 | Scenario auto-detection on startup, scenario-aware test skeletons, real-time streaming results, parallel test execution, troubleshooting guide with Fix tips per test, run history (5 per scenario), TPM/WHfB Config/Cloud AP/MDM/Secure Channel tests, registry-based SMB version detection, single-instance mutex, SSPI buffer zeroing, process lifecycle cleanup, reduced timeouts |
+| v1.2.0 | 2026-07-10 | Kerberos Tickets tab with klist viewer (ticket type badges, color-coded CIFS servers, Cache Flags, KDC Called), PRT status card from dsregcmd on Entra-joined devices, "What is this?" in-app explainer covering ticket types/Entra/PRT/delegation, domain suffix checkboxes on File Server and DC fields, GitHub and Release Notes links in header, purge moved to Tickets tab (removed from main page), removed Secure Channel test, settings moved to %LOCALAPPDATA%, ReadyToRun AOT for faster startup |
+| v1.1.0 | 2026-07-10 | Scenario auto-detection on startup, scenario-aware test skeletons, real-time streaming results, parallel test execution, troubleshooting guide with Fix tips per test, run history (5 per scenario), TPM/WHfB Config/Cloud AP/MDM tests, registry-based SMB version detection, single-instance mutex, SSPI buffer zeroing, process lifecycle cleanup, reduced timeouts |
 | v1.0.0 | 2026-07-09 | Initial release — dual-scenario diagnostics, SSPI negotiation testing, persistent input history, guide tabs, export |

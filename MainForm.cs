@@ -69,22 +69,23 @@ class MainForm : Form
     static readonly Font TabFontInactive = new("Segoe UI", 8.5f);
 
     readonly ComboBox _txtServer, _txtDomain, _txtDc, _txtShare;
+    readonly CheckBox _chkServerSuffix, _chkDcSuffix;
     readonly Button _btnAD, _btnEntra;
     int _scenarioIndex;
-    readonly CheckBox _chkPurge;
-    readonly Button _btnRun, _btnExport, _btnClear, _btnOpenShare, _btnTabResults, _btnTabGuide;
+    readonly Button _btnRun, _btnExport, _btnClear, _btnOpenShare, _btnTabResults, _btnTabGuide, _btnTabTickets, _btnPurgeTickets;
     readonly Label _lblStatus, _lblPassCount, _lblFailCount, _lblWarnCount;
-    readonly Panel _summaryPanel, _resultsCanvas, _resultsScrollPanel, _historyPanel;
-    readonly RichTextBox _guideBox;
+    readonly Panel _summaryPanel, _resultsCanvas, _resultsScrollPanel, _historyPanel, _ticketsPanel;
+    readonly RichTextBox _guideBox, _ticketsBox;
     List<TestGroup>? _lastResults;
     List<TestGroup>? _renderedGroups;
-    bool _renderRunning;
+    bool _renderRunning, _showingExplainer;
     string? _placeholderText;
     readonly Dictionary<int, List<DiagRun>> _runHistory = new() { [0] = [], [1] = [] };
     int _selectedRunIndex = -1;
     CancellationTokenSource? _runCts;
 
-    static string SettingsPath => Path.Combine(AppContext.BaseDirectory, "smb-diag-settings.json");
+    static string SettingsPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "smb-diag", "settings.json");
 
     public MainForm()
     {
@@ -120,7 +121,7 @@ class MainForm : Form
         var header = new Panel { Height = 34, Dock = DockStyle.Fill };
         header.Paint += (s, e) => e.Graphics.DrawLine(BorderPen, 0, header.Height - 1, header.Width, header.Height - 1);
         var lblTitle = new Label { Text = "SMB Auth Diagnostics", ForeColor = TextColor, Font = new Font("Segoe UI", 11f, FontStyle.Bold), AutoSize = true, Location = new Point(10, 6) };
-        var lblTag = new Label { Text = " v1.1.0 ", ForeColor = AccentColor, BackColor = AccentDimColor, Font = new Font("Segoe UI", 7.5f, FontStyle.Bold), AutoSize = true, Location = new Point(192, 10) };
+        var lblTag = new Label { Text = " v1.2.0 ", ForeColor = AccentColor, BackColor = AccentDimColor, Font = new Font("Segoe UI", 7.5f, FontStyle.Bold), AutoSize = true, Location = new Point(192, 10) };
         _btnAD = new Button
         {
             Text = "AD Joined", FlatStyle = FlatStyle.Flat,
@@ -141,16 +142,36 @@ class MainForm : Form
 
         _scenarioIndex = 0;
         StyleScenarioButtons();
-        header.Controls.AddRange([lblTitle, lblTag, _btnAD, _btnEntra]);
+        var lnkGithub = new LinkLabel { Text = "GitHub", Font = new Font("Segoe UI", 8f), AutoSize = true, LinkColor = AccentColor, ActiveLinkColor = AccentColor, VisitedLinkColor = AccentColor, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+        lnkGithub.LinkClicked += (s, e) => Process.Start(new ProcessStartInfo { FileName = "https://github.com/darthrater78/smb-diag", UseShellExecute = true });
+        var lnkRelease = new LinkLabel { Text = "Release Notes", Font = new Font("Segoe UI", 8f), AutoSize = true, LinkColor = AccentColor, ActiveLinkColor = AccentColor, VisitedLinkColor = AccentColor, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+        lnkRelease.LinkClicked += (s, e) => Process.Start(new ProcessStartInfo { FileName = "https://github.com/darthrater78/smb-diag/releases/latest", UseShellExecute = true });
+        header.Controls.AddRange([lblTitle, lblTag, _btnAD, _btnEntra, lnkGithub, lnkRelease]);
+        header.Resize += (s, e) =>
+        {
+            lnkRelease.Location = new Point(header.ClientSize.Width - lnkRelease.Width - 10, 10);
+            lnkGithub.Location = new Point(lnkRelease.Left - lnkGithub.Width - 12, 10);
+        };
         layout.Controls.Add(header, 0, 0);
 
         // Config
         var configPanel = new Panel { Height = 86, Dock = DockStyle.Fill };
         configPanel.Paint += (s, e) => e.Graphics.DrawLine(BorderPen, 0, configPanel.Height - 1, configPanel.Width, configPanel.Height - 1);
-        _txtServer = MakeInput(configPanel, "FILE SERVER (FQDN)", 0, 0);
+        _txtServer = MakeInput(configPanel, "FILE SERVER", 0, 0);
         _txtDomain = MakeInput(configPanel, "DOMAIN", 1, 0);
         _txtDc = MakeInput(configPanel, "DC HOSTNAME", 0, 1);
         _txtShare = MakeInput(configPanel, "SHARE PATH", 1, 1);
+
+        _chkServerSuffix = new CheckBox { Text = "+ domain suffix", ForeColor = DimColor, Font = new Font("Segoe UI", 7f), AutoSize = true, FlatStyle = FlatStyle.Flat, Location = new Point(130, 2) };
+        _chkDcSuffix = new CheckBox { Text = "+ domain suffix", ForeColor = DimColor, Font = new Font("Segoe UI", 7f), AutoSize = true, FlatStyle = FlatStyle.Flat, Location = new Point(130, 42) };
+        configPanel.Controls.AddRange([_chkServerSuffix, _chkDcSuffix]);
+        configPanel.Resize += (s, e) =>
+        {
+            int halfW = configPanel.ClientSize.Width / 2;
+            _chkServerSuffix.Location = new Point(halfW - _chkServerSuffix.Width - 14, 2);
+            _chkDcSuffix.Location = new Point(halfW - _chkDcSuffix.Width - 14, 42);
+        };
+
         layout.Controls.Add(configPanel, 0, 1);
 
         // Actions
@@ -171,9 +192,8 @@ class MainForm : Form
         _btnOpenShare = new Button { Text = "Open Share", BackColor = SurfaceColor, ForeColor = DimColor, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9f), Size = new Size(90, 26), Location = new Point(457, 4), Cursor = Cursors.Hand, Enabled = false };
         _btnOpenShare.FlatAppearance.BorderColor = BorderColor;
         _btnOpenShare.Click += BtnOpenShare_Click;
-        _chkPurge = new CheckBox { Text = "Purge tickets", ForeColor = DimColor, Font = new Font("Segoe UI", 8f), AutoSize = true, Location = new Point(555, 7), FlatStyle = FlatStyle.Flat };
-        _lblStatus = new Label { ForeColor = DimColor, Font = new Font("Segoe UI", 8.5f), AutoSize = true, Location = new Point(670, 10) };
-        actionsPanel.Controls.AddRange([_btnRun, _btnExport, _btnClear, btnReset, _btnOpenShare, _chkPurge, _lblStatus]);
+        _lblStatus = new Label { ForeColor = DimColor, Font = new Font("Segoe UI", 8.5f), AutoSize = false, Location = new Point(555, 4), Size = new Size(300, 28), Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right };
+        actionsPanel.Controls.AddRange([_btnRun, _btnExport, _btnClear, btnReset, _btnOpenShare, _lblStatus]);
         layout.Controls.Add(actionsPanel, 0, 2);
 
         // Summary bar
@@ -197,12 +217,16 @@ class MainForm : Form
         _btnTabResults = new Button { Text = "Results", FlatStyle = FlatStyle.Flat, BackColor = SurfaceColor, ForeColor = AccentColor, Font = new Font("Segoe UI", 8.5f, FontStyle.Bold), Size = new Size(80, 26), Location = new Point(10, 2), Cursor = Cursors.Hand };
         _btnTabResults.FlatAppearance.BorderColor = BorderColor;
         _btnTabResults.FlatAppearance.BorderSize = 1;
-        _btnTabResults.Click += (s, e) => SwitchTab(true);
+        _btnTabResults.Click += (s, e) => SwitchTab("results");
         _btnTabGuide = new Button { Text = "Guide", FlatStyle = FlatStyle.Flat, BackColor = BgColor, ForeColor = DimColor, Font = new Font("Segoe UI", 8.5f), Size = new Size(80, 26), Location = new Point(94, 2), Cursor = Cursors.Hand };
         _btnTabGuide.FlatAppearance.BorderColor = BorderColor;
         _btnTabGuide.FlatAppearance.BorderSize = 1;
-        _btnTabGuide.Click += (s, e) => SwitchTab(false);
-        tabBar.Controls.AddRange([_btnTabResults, _btnTabGuide]);
+        _btnTabGuide.Click += (s, e) => SwitchTab("guide");
+        _btnTabTickets = new Button { Text = "Kerberos Tickets", FlatStyle = FlatStyle.Flat, BackColor = BgColor, ForeColor = DimColor, Font = new Font("Segoe UI", 8.5f), Size = new Size(120, 26), Location = new Point(178, 2), Cursor = Cursors.Hand };
+        _btnTabTickets.FlatAppearance.BorderColor = BorderColor;
+        _btnTabTickets.FlatAppearance.BorderSize = 1;
+        _btnTabTickets.Click += (s, e) => { SwitchTab("tickets"); RefreshTickets(); };
+        tabBar.Controls.AddRange([_btnTabResults, _btnTabGuide, _btnTabTickets]);
 
         // Results canvas (owner-drawn, no more FlowLayoutPanel)
         _resultsScrollPanel = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = BgColor };
@@ -237,11 +261,43 @@ class MainForm : Form
         };
         PopulateGuide();
 
+        // Tickets panel
+        _ticketsBox = new RichTextBox
+        {
+            ReadOnly = true,
+            BackColor = BgColor,
+            ForeColor = TextColor,
+            BorderStyle = BorderStyle.None,
+            Dock = DockStyle.Fill,
+            Font = new Font("Cascadia Code", 9f),
+        };
+        _btnPurgeTickets = new Button { Text = "Purge All Tickets", BackColor = SurfaceColor, ForeColor = WarnColor, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9f, FontStyle.Bold), Size = new Size(140, 28), Dock = DockStyle.Bottom, Cursor = Cursors.Hand };
+        _btnPurgeTickets.FlatAppearance.BorderColor = BorderColor;
+        _btnPurgeTickets.Click += BtnPurgeTickets_Click;
+        var ticketsRefreshBtn = new Button { Text = "Refresh", BackColor = SurfaceColor, ForeColor = DimColor, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9f), Size = new Size(80, 28), Dock = DockStyle.Bottom, Cursor = Cursors.Hand };
+        ticketsRefreshBtn.FlatAppearance.BorderColor = BorderColor;
+        ticketsRefreshBtn.Click += (s, e) => RefreshTickets();
+        var ticketsInfoBtn = new Button { Text = "What is this?", BackColor = SurfaceColor, ForeColor = AccentColor, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9f), Size = new Size(100, 28), Cursor = Cursors.Hand };
+        ticketsInfoBtn.FlatAppearance.BorderColor = BorderColor;
+        ticketsInfoBtn.Click += (s, e) => { if (_showingExplainer) { _showingExplainer = false; RefreshTickets(); } else ShowTicketsExplainer(); };
+        var ticketsBtnPanel = new Panel { Height = 34, Dock = DockStyle.Bottom, BackColor = BgColor };
+        _btnPurgeTickets.Dock = DockStyle.None;
+        ticketsRefreshBtn.Dock = DockStyle.None;
+        ticketsInfoBtn.Dock = DockStyle.None;
+        _btnPurgeTickets.Location = new Point(10, 3);
+        ticketsRefreshBtn.Location = new Point(158, 3);
+        ticketsInfoBtn.Location = new Point(246, 3);
+        ticketsBtnPanel.Controls.AddRange([_btnPurgeTickets, ticketsRefreshBtn, ticketsInfoBtn]);
+        _ticketsPanel = new Panel { Dock = DockStyle.Fill, BackColor = BgColor, Visible = false };
+        _ticketsPanel.Controls.Add(_ticketsBox);
+        _ticketsPanel.Controls.Add(ticketsBtnPanel);
+
         _historyPanel = new Panel { Height = 28, Dock = DockStyle.Top, BackColor = BgColor, Visible = false };
         _historyPanel.Paint += (s, e) => e.Graphics.DrawLine(BorderPen, 0, _historyPanel.Height - 1, _historyPanel.Width, _historyPanel.Height - 1);
 
         contentWrapper.Controls.Add(_resultsScrollPanel);
         contentWrapper.Controls.Add(_guideBox);
+        contentWrapper.Controls.Add(_ticketsPanel);
         contentWrapper.Controls.Add(_historyPanel);
         contentWrapper.Controls.Add(tabBar);
         layout.Controls.Add(contentWrapper, 0, 4);
@@ -326,6 +382,10 @@ class MainForm : Form
                 _scenarioIndex = idx;
                 StyleScenarioButtons();
             }
+            if (s.TryGetValue("serverSuffix", out var ss) && ss.ValueKind == JsonValueKind.True)
+                _chkServerSuffix.Checked = true;
+            if (s.TryGetValue("dcSuffix", out var ds) && ds.ValueKind == JsonValueKind.True)
+                _chkDcSuffix.Checked = true;
         }
         catch { }
     }
@@ -390,7 +450,10 @@ class MainForm : Form
                 ["dc"] = ComboHistory(_txtDc),
                 ["share"] = ComboHistory(_txtShare),
                 ["scenario"] = _scenarioIndex,
+                ["serverSuffix"] = _chkServerSuffix.Checked,
+                ["dcSuffix"] = _chkDcSuffix.Checked,
             };
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
             File.WriteAllText(SettingsPath, JsonSerializer.Serialize(s, new JsonSerializerOptions { WriteIndented = true }));
         }
         catch { }
@@ -490,16 +553,440 @@ class MainForm : Form
 
     // ── Tab switching ───────────────────────────────────────
 
-    void SwitchTab(bool showResults)
+    void SwitchTab(string tab)
     {
-        _resultsScrollPanel.Visible = showResults;
-        _guideBox.Visible = !showResults;
-        _btnTabResults.BackColor = showResults ? SurfaceColor : BgColor;
-        _btnTabResults.ForeColor = showResults ? AccentColor : DimColor;
-        _btnTabResults.Font = showResults ? TabFontActive : TabFontInactive;
-        _btnTabGuide.BackColor = !showResults ? SurfaceColor : BgColor;
-        _btnTabGuide.ForeColor = !showResults ? AccentColor : DimColor;
-        _btnTabGuide.Font = !showResults ? TabFontActive : TabFontInactive;
+        _resultsScrollPanel.Visible = tab == "results";
+        _guideBox.Visible = tab == "guide";
+        _ticketsPanel.Visible = tab == "tickets";
+
+        foreach (var (btn, key) in new[] { (_btnTabResults, "results"), (_btnTabGuide, "guide"), (_btnTabTickets, "tickets") })
+        {
+            btn.BackColor = tab == key ? SurfaceColor : BgColor;
+            btn.ForeColor = tab == key ? AccentColor : DimColor;
+            btn.Font = tab == key ? TabFontActive : TabFontInactive;
+        }
+    }
+
+    // ── Tickets tab ─────────────────────────────────────────
+
+    static string CifsHostKey(string server)
+    {
+        string afterSlash = server.Contains('/') ? server.Split('/')[1] : server;
+        string beforeAt = afterSlash.Contains('@') ? afterSlash.Split('@')[0].Trim() : afterSlash.Trim();
+        return beforeAt.Split('.')[0];
+    }
+
+    static readonly Color[] CifsServerColors = [
+        Color.FromArgb(0x56, 0xb6, 0xc2), // cyan
+        Color.FromArgb(0xe5, 0xc0, 0x7b), // gold
+        Color.FromArgb(0xc6, 0x78, 0xdd), // purple
+        Color.FromArgb(0xe0, 0x6c, 0x75), // salmon
+        Color.FromArgb(0x61, 0xaf, 0xef), // blue
+        Color.FromArgb(0xd1, 0x9a, 0x66), // orange
+    ];
+
+    void RenderPrtStatus()
+    {
+        string dsreg;
+        try { dsreg = RunProcess("dsregcmd", "/status", timeoutMs: 5000); }
+        catch { return; }
+
+        bool aadJoined = Regex.IsMatch(dsreg, @"AzureAdJoined\s*:\s*YES", RegexOptions.IgnoreCase);
+        if (!aadJoined) return;
+
+        var prtMatch = Regex.Match(dsreg, @"AzureAdPrt\s*:\s*(\S+)", RegexOptions.IgnoreCase);
+        bool hasPrt = prtMatch.Success && prtMatch.Groups[1].Value.Equals("YES", StringComparison.OrdinalIgnoreCase);
+        var prtUpdateMatch = Regex.Match(dsreg, @"AzureAdPrtUpdateTime\s*:\s*(.+)", RegexOptions.IgnoreCase);
+        var prtExpiryMatch = Regex.Match(dsreg, @"AzureAdPrtExpiryTime\s*:\s*(.+)", RegexOptions.IgnoreCase);
+        var prtAuthMatch = Regex.Match(dsreg, @"AzureAdPrtAuthority\s*:\s*(.+)", RegexOptions.IgnoreCase);
+        var tenantMatch = Regex.Match(dsreg, @"TenantName\s*:\s*(.+)", RegexOptions.IgnoreCase);
+        var cloudTgtMatch = Regex.Match(dsreg, @"CloudTgt\s*:\s*(\S+)", RegexOptions.IgnoreCase);
+        var onPremTgtMatch = Regex.Match(dsreg, @"OnPremTgt\s*:\s*(\S+)", RegexOptions.IgnoreCase);
+        bool domJoined = Regex.IsMatch(dsreg, @"DomainJoined\s*:\s*YES", RegexOptions.IgnoreCase);
+        bool cloudTgt = cloudTgtMatch.Success && cloudTgtMatch.Groups[1].Value.Equals("YES", StringComparison.OrdinalIgnoreCase);
+        _cloudKerbTrust = cloudTgt && !domJoined;
+
+        Color prtBadge = hasPrt ? PassColor : FailColor;
+        AppendTicketsLine(" ┌─ ", BorderColor);
+        AppendTicketsLine(hasPrt ? " PRT " : " NO PRT ", Color.Black, bold: true, backColor: prtBadge);
+        AppendTicketsLine(hasPrt ? "  Primary Refresh Token — Entra ID SSO credential\n" : "  Primary Refresh Token not present\n", DimColor);
+        AppendTicketsLine(" │\n", BorderColor);
+
+        if (tenantMatch.Success)
+        {
+            AppendTicketsLine(" │  ", BorderColor);
+            AppendTicketsLine("Tenant: ", DimColor);
+            AppendTicketsLine(tenantMatch.Groups[1].Value.Trim() + "\n", TextColor, bold: true);
+        }
+
+        if (prtAuthMatch.Success)
+        {
+            AppendTicketsLine(" │  ", BorderColor);
+            AppendTicketsLine("Authority: ", DimColor);
+            AppendTicketsLine(prtAuthMatch.Groups[1].Value.Trim() + "\n", TextColor);
+        }
+
+        if (prtUpdateMatch.Success)
+        {
+            AppendTicketsLine(" │  ", BorderColor);
+            AppendTicketsLine("Last Refresh: ", DimColor);
+            AppendTicketsLine(prtUpdateMatch.Groups[1].Value.Trim() + "\n", TextColor);
+        }
+
+        if (prtExpiryMatch.Success)
+        {
+            AppendTicketsLine(" │  ", BorderColor);
+            AppendTicketsLine("Expiry: ", DimColor);
+            string expiry = prtExpiryMatch.Groups[1].Value.Trim();
+            bool expired = DateTime.TryParse(expiry, out var expDt) && expDt < DateTime.Now;
+            AppendTicketsLine(expiry + (expired ? "  EXPIRED" : "") + "\n", expired ? FailColor : TextColor);
+        }
+
+        if (cloudTgtMatch.Success)
+        {
+            bool cloudYes = cloudTgtMatch.Groups[1].Value.Equals("YES", StringComparison.OrdinalIgnoreCase);
+            AppendTicketsLine(" │  ", BorderColor);
+            AppendTicketsLine("Cloud TGT: ", DimColor);
+            AppendTicketsLine(cloudTgtMatch.Groups[1].Value.Trim() + "\n", cloudYes ? PassColor : WarnColor);
+        }
+
+        if (onPremTgtMatch.Success)
+        {
+            bool onPremYes = onPremTgtMatch.Groups[1].Value.Equals("YES", StringComparison.OrdinalIgnoreCase);
+            AppendTicketsLine(" │  ", BorderColor);
+            AppendTicketsLine("On-Prem TGT: ", DimColor);
+            AppendTicketsLine(onPremTgtMatch.Groups[1].Value.Trim() + "\n", onPremYes ? PassColor : WarnColor);
+        }
+
+        AppendTicketsLine(" └──\n\n", BorderColor);
+    }
+
+    bool _cloudKerbTrust;
+
+    void RefreshTickets()
+    {
+        _ticketsBox.Clear();
+        _cloudKerbTrust = false;
+        RenderPrtStatus();
+        string raw;
+        try { raw = RunProcess("klist", "", timeoutMs: 5000); }
+        catch (Exception ex) { AppendTicketsLine($"Error running klist: {ex.Message}\n", DimColor); return; }
+
+        if (string.IsNullOrWhiteSpace(raw) || raw.Contains("no credentials", StringComparison.OrdinalIgnoreCase))
+        {
+            AppendTicketsLine("No Kerberos tickets cached.\n", DimColor);
+            return;
+        }
+
+        var lines = raw.Split('\n');
+        var headers = new List<string>();
+        var tickets = new List<(string Server, Dictionary<string, string> Fields)>();
+        string? currentServer = null;
+        var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (string rawLine in lines)
+        {
+            string line = rawLine.TrimEnd('\r');
+            if (string.IsNullOrWhiteSpace(line)) continue;
+
+            if (line.StartsWith("Current LogonId", StringComparison.OrdinalIgnoreCase)
+                || line.StartsWith("Cached Tickets", StringComparison.OrdinalIgnoreCase))
+            {
+                headers.Add(line);
+                continue;
+            }
+
+            if (line.TrimStart().StartsWith("#"))
+            {
+                if (currentServer != null)
+                    tickets.Add((currentServer, new Dictionary<string, string>(fields, StringComparer.OrdinalIgnoreCase)));
+                currentServer = null;
+                fields.Clear();
+                continue;
+            }
+
+            var kv = line.Split(':', 2);
+            if (kv.Length == 2)
+            {
+                string key = kv[0].Trim();
+                string val = kv[1].Trim();
+                if (key.Equals("Server", StringComparison.OrdinalIgnoreCase))
+                    currentServer = val;
+                else
+                    fields[key] = val;
+            }
+        }
+        if (currentServer != null)
+            tickets.Add((currentServer, new Dictionary<string, string>(fields, StringComparer.OrdinalIgnoreCase)));
+
+        var cifsColorMap = new Dictionary<string, Color>(StringComparer.OrdinalIgnoreCase);
+        int colorIdx = 0;
+        foreach (var t in tickets)
+        {
+            string svc = t.Server.Split('/')[0];
+            if (svc.Equals("cifs", StringComparison.OrdinalIgnoreCase))
+            {
+                string host = CifsHostKey(t.Server);
+                if (!cifsColorMap.ContainsKey(host))
+                    cifsColorMap[host] = CifsServerColors[colorIdx++ % CifsServerColors.Length];
+            }
+        }
+
+        foreach (var h in headers)
+        {
+            if (h.StartsWith("Current LogonId", StringComparison.OrdinalIgnoreCase))
+                AppendTicketsLine(h + "\n\n", DimColor);
+            else
+                AppendTicketsLine(h + "\n", AccentColor, bold: true);
+        }
+
+        for (int i = 0; i < tickets.Count; i++)
+            RenderTicket(tickets[i].Server, tickets[i].Fields, i, cifsColorMap);
+
+        if (tickets.Count == 0)
+            AppendTicketsLine("No Kerberos tickets cached.\n", DimColor);
+    }
+
+    void RenderTicket(string server, Dictionary<string, string> fields, int index, Dictionary<string, Color> cifsColorMap)
+    {
+        string svc = server.Split('/')[0].ToUpperInvariant();
+        bool isAzureTgt = svc == "KRBTGT" && server.Contains("AZUREAD", StringComparison.OrdinalIgnoreCase);
+        string cacheFlag = fields.TryGetValue("Cache Flags", out var cf) ? cf : "";
+        bool isDelegation = cacheFlag.Contains("DELEGATION", StringComparison.OrdinalIgnoreCase);
+        bool isPrimary = cacheFlag.Contains("PRIMARY", StringComparison.OrdinalIgnoreCase);
+
+        string tgtDesc = isAzureTgt ? "Cloud Kerberos trust TGT — issued via PRT from Entra ID"
+            : isDelegation ? "Delegation TGT — forwarded for Kerberos delegation"
+            : isPrimary && _cloudKerbTrust ? "Primary TGT — obtained via PRT through cloud Kerberos trust"
+            : isPrimary ? "Primary TGT — your main logon credential from the KDC"
+            : "Ticket Granting Ticket — master key from KDC";
+
+        var (label, desc) = svc switch
+        {
+            "KRBTGT" => ("TGT", tgtDesc),
+            "CIFS" => ("CIFS", "SMB file share service ticket"),
+            "HTTP" => ("HTTP", "Web service ticket (ADFS, Exchange, etc.)"),
+            "LDAP" => ("LDAP", "Directory service ticket"),
+            "HOST" => ("HOST", "Host service ticket (remote admin, WinRM)"),
+            "RPCSS" => ("RPCSS", "RPC service ticket"),
+            "DNS" => ("DNS", "DNS service ticket"),
+            "TERMSRV" => ("RDP", "Remote Desktop service ticket"),
+            "MSSQLSVC" => ("SQL", "SQL Server service ticket"),
+            "EXCHANGEMDB" => ("EXCH", "Exchange mailbox service ticket"),
+            _ => ("SVC", $"{svc} service ticket"),
+        };
+
+        bool isCifs = svc == "CIFS";
+        string hostKey = isCifs ? CifsHostKey(server) : "";
+        Color serverColor = isCifs && cifsColorMap.TryGetValue(hostKey, out var cc) ? cc : TextColor;
+        Color badgeBg = isCifs && cifsColorMap.TryGetValue(hostKey, out var cb) ? cb : (svc == "KRBTGT" ? AccentColor : PassColor);
+
+        AppendTicketsLine($"\n ┌─ ", BorderColor);
+        AppendTicketsLine($" {label} ", Color.Black, bold: true, backColor: badgeBg);
+        AppendTicketsLine($"  {desc}\n", DimColor);
+        AppendTicketsLine($" │\n", BorderColor);
+
+        AppendTicketsLine($" │  ", BorderColor);
+        AppendTicketsLine("Server: ", DimColor);
+        AppendTicketsLine(server + "\n", serverColor, bold: true);
+
+        if (fields.TryGetValue("Client", out var client))
+        {
+            AppendTicketsLine($" │  ", BorderColor);
+            AppendTicketsLine("Client: ", DimColor);
+            AppendTicketsLine(client + "\n", TextColor, bold: true);
+        }
+
+        if (fields.TryGetValue("KerbTicket Encryption Type", out var enc))
+        {
+            AppendTicketsLine($" │  ", BorderColor);
+            AppendTicketsLine("Encryption: ", DimColor);
+            Color encColor = enc.Contains("AES", StringComparison.OrdinalIgnoreCase) ? PassColor
+                : enc.Contains("RC4", StringComparison.OrdinalIgnoreCase) ? WarnColor : TextColor;
+            AppendTicketsLine(enc + "\n", encColor);
+        }
+
+        if (fields.TryGetValue("Ticket Flags", out var flags))
+        {
+            AppendTicketsLine($" │  ", BorderColor);
+            AppendTicketsLine("Flags: ", DimColor);
+            AppendTicketsLine(flags + "\n", DimColor);
+        }
+
+        if (!string.IsNullOrEmpty(cacheFlag))
+        {
+            AppendTicketsLine($" │  ", BorderColor);
+            AppendTicketsLine("Cache: ", DimColor);
+            AppendTicketsLine(cacheFlag + "\n", isDelegation ? WarnColor : isPrimary ? PassColor : TextColor);
+        }
+
+        if (fields.TryGetValue("Kdc Called", out var kdc))
+        {
+            AppendTicketsLine($" │  ", BorderColor);
+            AppendTicketsLine("KDC: ", DimColor);
+            AppendTicketsLine(kdc + "\n", TextColor);
+        }
+
+        foreach (var timeKey in new[] { "Start Time", "End Time", "Renew Time" })
+        {
+            if (!fields.TryGetValue(timeKey, out var timeVal)) continue;
+            AppendTicketsLine($" │  ", BorderColor);
+            AppendTicketsLine($"{timeKey}: ", DimColor);
+
+            bool expired = false;
+            if (timeKey == "End Time")
+            {
+                string cleaned = Regex.Replace(timeVal, @"\s*\(.*?\)\s*$", "");
+                expired = DateTime.TryParse(cleaned, out var endTime) && endTime < DateTime.Now;
+            }
+            AppendTicketsLine(timeVal + (expired ? "  EXPIRED" : "") + "\n", expired ? FailColor : TextColor);
+        }
+
+        AppendTicketsLine($" └──\n", BorderColor);
+    }
+
+    void ShowTicketsExplainer()
+    {
+        _showingExplainer = true;
+        _ticketsBox.Clear();
+
+        AppendTicketsLine("KERBEROS TICKETS EXPLAINED\n\n", AccentColor, bold: true);
+
+        AppendTicketsLine("What are Kerberos tickets?\n", TextColor, bold: true);
+        AppendTicketsLine("When you log in to a Windows domain, the Key Distribution Center (KDC)\n", DimColor);
+        AppendTicketsLine("issues you a Ticket Granting Ticket (TGT). This TGT is your master\n", DimColor);
+        AppendTicketsLine("credential — it proves your identity without sending your password again.\n\n", DimColor);
+
+        AppendTicketsLine("Each time you access a network resource (file share, web app, database),\n", DimColor);
+        AppendTicketsLine("your TGT is used to request a service ticket for that specific resource.\n", DimColor);
+        AppendTicketsLine("These service tickets are cached so you don't re-authenticate every time.\n\n", DimColor);
+
+        AppendTicketsLine("TICKET TYPES\n\n", AccentColor, bold: true);
+
+        AppendTicketsLine(" TGT  ", Color.Black, bold: true, backColor: AccentColor);
+        AppendTicketsLine("  Ticket Granting Ticket\n", TextColor, bold: true);
+        AppendTicketsLine("       Your master Kerberos credential from the domain controller.\n", DimColor);
+        AppendTicketsLine("       Server field shows: krbtgt/REALM @ REALM\n", DimColor);
+        AppendTicketsLine("       If this is missing or expired, nothing else works.\n\n", DimColor);
+        AppendTicketsLine("       You may see two TGTs — check the Cache Flags to tell them apart:\n", DimColor);
+        AppendTicketsLine("       • PRIMARY", PassColor, bold: true);
+        AppendTicketsLine(" — your main logon TGT, issued during interactive login\n", DimColor);
+        AppendTicketsLine("       • DELEGATION", WarnColor, bold: true);
+        AppendTicketsLine(" — a forwarded TGT for Kerberos delegation. Issued when a\n", DimColor);
+        AppendTicketsLine("         service (e.g. a DC or web server) is trusted for delegation\n", DimColor);
+        AppendTicketsLine("         and needs to act on your behalf to access other resources.\n", DimColor);
+        AppendTicketsLine("         Triggered by the ok_as_delegate flag on a service ticket.\n\n", DimColor);
+        AppendTicketsLine("       On Entra-joined devices with cloud Kerberos trust, the PRIMARY\n", DimColor);
+        AppendTicketsLine("       TGT is obtained via the PRT — but it looks identical to a\n", DimColor);
+        AppendTicketsLine("       normal on-prem TGT in klist (same krbtgt/REALM format). The\n", DimColor);
+        AppendTicketsLine("       PRT card above shows whether cloud Kerberos trust is active.\n", DimColor);
+        AppendTicketsLine("       If CloudTgt: YES and DomainJoined: NO, your TGTs came through\n", DimColor);
+        AppendTicketsLine("       the PRT, not from direct KDC contact during logon.\n\n", DimColor);
+
+        AppendTicketsLine(" CIFS ", Color.Black, bold: true, backColor: PassColor);
+        AppendTicketsLine("  SMB/File Share\n", TextColor, bold: true);
+        AppendTicketsLine("       Grants access to Windows file shares (\\\\server\\share).\n", DimColor);
+        AppendTicketsLine("       This is the ticket smb-diag cares about most.\n", DimColor);
+        AppendTicketsLine("       You may see multiple CIFS entries — one per file server you've\n", DimColor);
+        AppendTicketsLine("       accessed. DFS environments often show two: one for the DFS\n", DimColor);
+        AppendTicketsLine("       namespace server and one for the actual file server hosting\n", DimColor);
+        AppendTicketsLine("       the data. This is normal.\n\n", DimColor);
+
+        AppendTicketsLine(" HTTP ", Color.Black, bold: true, backColor: PassColor);
+        AppendTicketsLine("  Web Service\n", TextColor, bold: true);
+        AppendTicketsLine("       Used for Kerberos-authenticated web apps, ADFS, Exchange OWA.\n\n", DimColor);
+
+        AppendTicketsLine(" LDAP ", Color.Black, bold: true, backColor: PassColor);
+        AppendTicketsLine("  Directory Service\n", TextColor, bold: true);
+        AppendTicketsLine("       Used for Active Directory lookups and queries.\n\n", DimColor);
+
+        AppendTicketsLine(" HOST ", Color.Black, bold: true, backColor: PassColor);
+        AppendTicketsLine("  Host/Remote Admin\n", TextColor, bold: true);
+        AppendTicketsLine("       Used for WinRM, remote management, and scheduled tasks.\n\n", DimColor);
+
+        AppendTicketsLine(" RDP  ", Color.Black, bold: true, backColor: PassColor);
+        AppendTicketsLine("  Remote Desktop\n", TextColor, bold: true);
+        AppendTicketsLine("       Authenticates Remote Desktop (TERMSRV) connections.\n\n", DimColor);
+
+        AppendTicketsLine("ENCRYPTION\n\n", AccentColor, bold: true);
+        AppendTicketsLine("  AES-256  ", PassColor);
+        AppendTicketsLine("— Strong. Expected on modern domains.\n", DimColor);
+        AppendTicketsLine("  RC4      ", WarnColor);
+        AppendTicketsLine("— Weak. May indicate legacy systems or misconfigured SPNs.\n\n", DimColor);
+
+        AppendTicketsLine("ENTRA ID (AZURE AD) & THE PRT\n\n", AccentColor, bold: true);
+
+        AppendTicketsLine("In hybrid or cloud-only environments, Entra ID uses a different model.\n", DimColor);
+        AppendTicketsLine("Instead of a TGT from an on-prem KDC, your device gets a ", DimColor);
+        AppendTicketsLine("Primary Refresh\n", TextColor, bold: true);
+        AppendTicketsLine("Token (PRT)", TextColor, bold: true);
+        AppendTicketsLine(" — a long-lived device credential issued when you sign in with\n", DimColor);
+        AppendTicketsLine("your Entra ID account or when the device is joined/registered.\n\n", DimColor);
+
+        AppendTicketsLine("How the PRT differs from a TGT:\n", TextColor, bold: true);
+        AppendTicketsLine("  • A TGT lives in the Kerberos ticket cache (shown below on this screen).\n", DimColor);
+        AppendTicketsLine("    The PRT lives in the CloudAP plugin — its status is shown in the\n", DimColor);
+        AppendTicketsLine("    PRT card above (on Entra-joined devices), sourced from dsregcmd.\n", DimColor);
+        AppendTicketsLine("  • The TGT is exchanged for service tickets via Kerberos.\n", DimColor);
+        AppendTicketsLine("    The PRT is exchanged for OAuth tokens via Entra ID endpoints.\n", DimColor);
+        AppendTicketsLine("  • In hybrid setups, the PRT can request a TGT from the on-prem KDC\n", DimColor);
+        AppendTicketsLine("    through cloud Kerberos trust — so you may see a TGT here even when\n", DimColor);
+        AppendTicketsLine("    authentication started with Entra ID.\n", DimColor);
+        AppendTicketsLine("  • Purging Kerberos tickets does ", DimColor);
+        AppendTicketsLine("not", WarnColor, bold: true);
+        AppendTicketsLine(" invalidate the PRT. SSO to cloud\n", DimColor);
+        AppendTicketsLine("    resources (M365, Azure, SaaS apps) continues to work after a purge.\n\n", DimColor);
+
+        AppendTicketsLine("PRT status is shown at the top of this screen on Entra-joined devices.\n", DimColor);
+        AppendTicketsLine("For full details, run: ", DimColor);
+        AppendTicketsLine("dsregcmd /status\n\n", TextColor, bold: true);
+
+        AppendTicketsLine("WHAT DOES PURGE DO?\n\n", AccentColor, bold: true);
+        AppendTicketsLine("Purging destroys all cached Kerberos tickets. Your TGT is re-acquired\n", DimColor);
+        AppendTicketsLine("on next authentication, and service tickets are re-requested on next\n", DimColor);
+        AppendTicketsLine("access. Useful when troubleshooting stale credentials or delegation\n", DimColor);
+        AppendTicketsLine("issues. Purge does ", DimColor);
+        AppendTicketsLine("not", WarnColor, bold: true);
+        AppendTicketsLine(" affect your PRT or cloud SSO.\n\n", DimColor);
+
+        AppendTicketsLine("Click ", DimColor);
+        AppendTicketsLine("What is this?", AccentColor, bold: true);
+        AppendTicketsLine(" again to return to the ticket list.\n", DimColor);
+    }
+
+    void AppendTicketsLine(string text, Color color, bool bold = false, Color? backColor = null)
+    {
+        _ticketsBox.SelectionStart = _ticketsBox.TextLength;
+        _ticketsBox.SelectionLength = 0;
+        _ticketsBox.SelectionColor = color;
+        _ticketsBox.SelectionBackColor = backColor ?? _ticketsBox.BackColor;
+        _ticketsBox.SelectionFont = bold
+            ? new Font(_ticketsBox.Font, FontStyle.Bold)
+            : _ticketsBox.Font;
+        _ticketsBox.AppendText(text);
+    }
+
+    void BtnPurgeTickets_Click(object? sender, EventArgs e)
+    {
+        var confirm = MessageBox.Show(
+            "This will destroy all cached Kerberos tickets.\n\n"
+            + "Your TGT will be re-acquired on next authentication, but you may need to "
+            + "re-authenticate to access network resources (file shares, web apps, etc.).\n\n"
+            + "Continue?",
+            "Purge Kerberos Tickets", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+        if (confirm != DialogResult.Yes) return;
+
+        try
+        {
+            RunProcess("klist", "purge", timeoutMs: 5000);
+            _lblStatus.Text = "Tickets purged — run diagnostics twice (first run reacquires tickets, second shows true results)";
+            _lblStatus.ForeColor = WarnColor;
+            RefreshTickets();
+        }
+        catch (Exception ex)
+        {
+            _lblStatus.Text = $"Purge failed: {ex.Message}";
+        }
     }
 
     // ── Guide content ───────────────────────────────────────
@@ -787,6 +1274,8 @@ class MainForm : Form
         {
             string msg = _placeholderText ?? "Enter target details and run diagnostics";
             TextRenderer.DrawText(g, msg, PlaceholderFont, new Point(16, 40), DimColor);
+            string hint = "Tip: Run diagnostics twice for accurate results — the first run may trigger ticket acquisition.";
+            TextRenderer.DrawText(g, hint, PlaceholderFont, new Rectangle(16, 70, w - 32, 40), DimColor, TextFormatFlags.WordBreak);
             return;
         }
 
@@ -852,9 +1341,13 @@ class MainForm : Form
 
     async void BtnRun_Click(object? sender, EventArgs e)
     {
-        string server = _txtServer.Text.Trim();
         string domain = _txtDomain.Text.Trim();
+        string server = _txtServer.Text.Trim();
+        if (_chkServerSuffix.Checked && !string.IsNullOrEmpty(domain) && !server.Contains('.'))
+            server = $"{server}.{domain}";
         string dc = _txtDc.Text.Trim();
+        if (_chkDcSuffix.Checked && !string.IsNullOrEmpty(domain) && !dc.Contains('.'))
+            dc = $"{dc}.{domain}";
         string share = _txtShare.Text.Trim();
 
         if (string.IsNullOrEmpty(server) || string.IsNullOrEmpty(domain))
@@ -887,8 +1380,9 @@ class MainForm : Form
         _btnRun.Enabled = false;
         _btnExport.Enabled = false;
         _summaryPanel.Visible = false;
+        _lblStatus.ForeColor = DimColor;
         _lblStatus.Text = "Running diagnostics...";
-        SwitchTab(true);
+        SwitchTab("results");
 
         bool isEntra = scenario == Scenario.Entra;
         var results = BuildSkeleton(isEntra);
@@ -899,8 +1393,7 @@ class MainForm : Form
         _selectedRunIndex = 0;
         RebuildHistoryBar();
 
-        bool purge = _chkPurge.Checked;
-        var config = new DiagConfig(server, domain, dc, share, scenario, purge);
+        var config = new DiagConfig(server, domain, dc, share, scenario);
         int completed = 0;
         int totalGroups = results.Count;
 
@@ -950,27 +1443,6 @@ class MainForm : Form
             var kerbConfig = await Task.Run(() => TestKerberosConfig(config, hasCifsTicket));
             if (cts.IsCancellationRequested || IsDisposed) return;
             ReplaceGroup("Kerberos Configuration", kerbConfig);
-        }
-
-        if (purge)
-        {
-            _chkPurge.Checked = false;
-            _lblStatus.Text = "Reacquiring tickets...";
-            await Task.Delay(500);
-            if (cts.IsCancellationRequested || IsDisposed) return;
-            var refetchConfig = config with { PurgeTickets = false };
-            var freshKerb = await Task.Run(() => TestKerberosTickets(refetchConfig));
-            if (cts.IsCancellationRequested || IsDisposed) return;
-            int kerbIdx = results.FindIndex(g => g.Name == "Kerberos Tickets");
-            if (kerbIdx >= 0)
-            {
-                var purgeEntry = results[kerbIdx].Tests.FirstOrDefault(t => t.Name == "Ticket Purge");
-                var freshTests = new List<TestEntry>();
-                if (purgeEntry != null) freshTests.Add(purgeEntry);
-                freshTests.AddRange(freshKerb.Tests.Where(t => t.Name != "Ticket Purge"));
-                results[kerbIdx] = new TestGroup("Kerberos Tickets", freshTests);
-                ShowResults(results);
-            }
         }
 
         _lastResults = results;
@@ -1487,19 +1959,6 @@ class MainForm : Form
     {
         var tests = new List<TestEntry>();
         string realm = cfg.Domain.ToUpperInvariant();
-
-        if (cfg.PurgeTickets)
-        {
-            try
-            {
-                RunProcess("klist", "purge");
-                tests.Add(new("Ticket Purge", Status.Pass, "Purged all cached tickets — reacquiring"));
-            }
-            catch (Exception ex)
-            {
-                tests.Add(new("Ticket Purge", Status.Warn, $"Purge failed: {ex.Message}"));
-            }
-        }
 
         try
         {
@@ -2308,7 +2767,7 @@ class MainForm : Form
 // ── Data types ──────────────────────────────────────────
 
 enum Scenario { AD, Entra }
-record DiagConfig(string Server, string Domain, string Dc, string Share, Scenario Scenario, bool PurgeTickets);
+record DiagConfig(string Server, string Domain, string Dc, string Share, Scenario Scenario);
 enum Status { Pass, Fail, Warn, Skip }
 record TestEntry(string Name, Status Status = Status.Skip, string Detail = "");
 record TestGroup(string Name, List<TestEntry> Tests);
