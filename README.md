@@ -6,21 +6,48 @@ Standalone Windows diagnostic tool that tests the full SMB/Kerberos authenticati
 
 Grab `smb-diag.exe` from the [latest release](https://github.com/darthrater78/smb-diag/releases/latest). No installation — just run.
 
+## Windows SmartScreen
+
+On first launch, Windows SmartScreen may display a warning ("Windows protected your PC"). This is normal for unsigned executables from the internet. The app is not code-signed — it is a self-contained .NET 8 single-file executable built from the source in this repository. Click **More info** then **Run anyway** to proceed.
+
 ## Usage
 
 1. Launch `smb-diag.exe`
-2. Select scenario: **AD Joined** (on-prem/VPN) or **Entra Joined** (cloud/CKT)
+2. The app auto-detects your device join type (AD or Entra) on startup via `dsregcmd /status`
 3. Enter target details:
    - **File Server (FQDN)** — e.g. `fileserver.contoso.com`
    - **Domain** — e.g. `contoso.com`
    - **DC Hostname** — optional, defaults to domain for KDC lookups
    - **Share Path** — optional share name for access test (e.g. `shared$`)
-4. Click **Run Diagnostics**
-5. Review results or switch to the **Guide** tab for explanations of each test
+4. Click **Run Diagnostics** — results stream in as each test group completes
+5. Review results or switch to the **Guide** tab for explanations and troubleshooting tips
 
-Input fields remember previously entered values in a dropdown — select from history or type new values. Click **Clear** to wipe all saved history.
+Input fields remember previously entered values in a dropdown. Up to 5 diagnostic runs are stored per scenario with timestamps — click any run to review it, or **Delete Run** to remove it.
 
-**Export Results** saves a timestamped text report via Save dialog.
+- **Clear** — clears results and run history, keeps input fields and saved settings
+- **Reset** — clears everything including input fields and deletes the settings file
+- **Export Results** — saves a timestamped text report via Save dialog
+
+## Security
+
+### No credentials are stored or transmitted
+
+This tool is **read-only and diagnostic**. It does not store, transmit, or log any credentials, tokens, or secrets.
+
+- **SSPI token buffers are zeroed before freeing.** The Negotiate and NTLM token buffers allocated via `Marshal.AllocHGlobal` are explicitly cleared (`Span<byte>.Clear()`) before being freed, preventing auth tokens from lingering in heap memory.
+- **No credentials are written to disk.** The settings file (`smb-diag-settings.json`) contains only input field history (hostnames) and scenario selection — never credentials, tokens, or ticket data.
+- **Exported reports contain only metadata.** The text export includes test names and diagnostic details (ticket names, expiry times, encryption types, port status). No raw tokens, password hashes, or credential material is included.
+- **External process output is not persisted.** Output from `dsregcmd`, `klist`, `cmdkey`, and other tools is parsed in memory for specific values only. The raw output is never written to disk or stored beyond the method scope.
+- **`net use` connections are immediately cleaned up.** The Share Access Test creates a temporary connection and deletes it (`net use /delete`) immediately after the test.
+- **SSPI contexts are properly released.** `DeleteSecurityContext` and `FreeCredentialsHandle` are called in `finally` blocks to ensure native security handles are not leaked.
+- **`cmdkey /list` output is only string-searched.** The Credential Manager test checks for the presence of server/domain entries — the raw credential list is never stored or exported.
+
+### Process isolation
+
+- **Single instance enforced.** A global mutex prevents multiple instances from running simultaneously.
+- **Background tasks are cancelled on exit.** All async diagnostic work is cancelled via `CancellationToken` on form close, and `Environment.Exit(0)` is called on `FormClosed` as a backstop to ensure the process cannot linger.
+- **Input validation on all fields.** Server, domain, and DC fields are validated against `^[a-zA-Z0-9.\-]+$`. Share names are validated against `^[a-zA-Z0-9_\-$.]+$`. No user input is passed to shell commands without validation.
+- **No shell execution for diagnostics.** All external processes are launched with `UseShellExecute = false`, `CreateNoWindow = true`, and killed on timeout. The only `UseShellExecute = true` call is the **Open Share** button, which opens a validated UNC path in Explorer.
 
 ## Scenarios
 
@@ -35,13 +62,17 @@ Input fields remember previously entered values in a dropdown — select from hi
 
 Parses `dsregcmd /status` and checks `WindowsIdentity.GetCurrent()`.
 
-- **Domain Join Type** — DomainJoined status (required for AD scenario)
-- **Azure AD Join** — AzureAdJoined status (required for Entra scenario)
-- **Cloud Kerberos Trust** — CloudTgt must be YES for Entra SSO to on-prem resources
-- **OnPremTgt** — confirms CKT is issuing on-prem TGTs via Azure AD
+- **Domain Join Type** — DomainJoined status (required for AD, informational for Entra)
+- **Azure AD Join** — AzureAdJoined status (required for Entra, informational for AD showing hybrid state)
+- **Cloud Kerberos Trust** — CloudTgt must be YES for Entra SSO to on-prem resources (Entra only)
+- **OnPremTgt** — confirms CKT is issuing on-prem TGTs via Azure AD (Entra only)
 - **Logged-on User** — current Windows identity (DOMAIN\user)
 - **WHfB Status** — Windows Hello enrollment; when enabled, NTLM password hash may not be cached
+- **TPM Status** — detected via tpmtool, registry, Get-Tpm, and ACPI device enumeration
+- **WHfB Config** — trust model (Cloud Kerberos Trust, Certificate Trust, Key Trust), TPM policy, enrolled credentials
 - **PRT Status** — Primary Refresh Token required for seamless SSO (Entra only)
+- **Cloud AP Plugin** — Azure AD CloudAP authentication plugin presence (Entra only)
+- **MDM Enrollment** — Intune/MDM enrollment and management status (Entra only)
 
 ### 2. Kerberos Tickets
 
@@ -71,23 +102,30 @@ Uses Windows SSPI API (`secur32.dll`) to test the complete client-side authentic
 
 ### 5. Network Path
 
-Tests connectivity to services required for SMB authentication.
+Tests connectivity to services required for SMB authentication. Port checks run in parallel.
 
-- **DNS Resolution** — resolves file server FQDN to IP addresses
+- **DNS Resolution** — resolves file server FQDN to IPv4 addresses
 - **Port 445 (SMB)** — direct SMB/CIFS file sharing
 - **Port 88 (Kerberos)** — KDC port; unreachable = warning for Entra (uses cloud KDC), failure for AD
 - **Port 389 (LDAP)** — directory services
 - **Port 464 (kpasswd)** — Kerberos password change service (AD only)
 - **Clock Skew** — measured via `w32tm` against DC; Kerberos has strict 5-minute tolerance
+- **DNS Servers** — configured DNS servers from `ipconfig /all`
+- **DNS Suffix** — warns if domain is not in the DNS suffix search list
+- **IPv6 Status** — dual-stack, IPv4-only, or IPv6-only detection
 
 ### 6. SMB Configuration
 
-- **LmCompatibility Level** — Level 3+ (NTLMv2 only) recommended (AD only)
+- **LmCompatibility Level** — Level 3+ (NTLMv2 only) recommended; shows "(OS default)" when not explicitly set (AD only)
 - **SMB Signing** — Required prevents MITM; Enabled allows but doesn't enforce
-- **SMB Versions** — SMBv1 should be disabled; SMBv2/3 required
-- **Share Access Test** — `net use` to configured UNC path with cleanup
+- **SMB Versions** — SMBv1 should be disabled; SMBv2/3 required. Detected via registry (mrxsmb10 driver, LanmanServer SMB1/SMB2 values)
+- **Guest Fallback** — AllowInsecureGuestAuth should be disabled (secure default)
 
-### 7. Credential Store
+### 7. Share Access
+
+- **Share Access Test** — `net use` to configured UNC path with automatic cleanup via `net use /delete`
+
+### 8. Credential Store
 
 - **Credential Manager** — queries `cmdkey /list` for saved credentials (AD only). Absence is normal — Kerberos SSO doesn't require saved credentials
 - **NTLM Hash Available** — generates an NTLM token via SSPI to definitively test whether the password hash is cached in LSASS. More reliable than registry checks
@@ -98,9 +136,9 @@ Tests connectivity to services required for SMB authentication.
 
 **Structure:** Single-file app (`MainForm.cs`). All UI, diagnostics, and SSPI interop in one compilation unit.
 
-**UI:** Owner-drawn `Panel` with `TextRenderer.MeasureText` for word-wrapped results. Static GDI resources prevent handle leaks. Double-buffered rendering eliminates flicker. Dark theme.
+**UI:** Owner-drawn `Panel` with `TextRenderer.MeasureText` for word-wrapped results. Static GDI resources prevent handle leaks. Double-buffered rendering eliminates flicker. Dark theme. Test groups stream results in real-time as each completes.
 
-**SSPI Interop:** Direct `secur32.dll` P/Invoke. All native memory (`Marshal.AllocHGlobal`) tracked before try blocks and freed in `finally` blocks.
+**SSPI Interop:** Direct `secur32.dll` P/Invoke. All native memory (`Marshal.AllocHGlobal`) tracked before try blocks, zeroed, and freed in `finally` blocks.
 
 **Input Validation:**
 - `HostnamePattern`: `^[a-zA-Z0-9.\-]+$` — server, domain, DC fields
@@ -112,16 +150,18 @@ Tests connectivity to services required for SMB authentication.
 
 | Process | Purpose | Timeout |
 |---|---|---|
-| `dsregcmd /status` | Device join state | 15s |
+| `dsregcmd /status` | Device join state | 5s |
 | `klist` | Kerberos ticket cache | 15s |
-| `setspn -Q` | SPN lookup in AD | 15s |
-| `nslookup -type=SRV` | Kerberos DNS discovery | 15s |
-| `w32tm /stripchart` | Clock skew measurement | 15s |
+| `klist purge` | Clear ticket cache | 15s |
+| `setspn -Q` | SPN lookup in AD | 5s |
+| `nslookup -type=SRV` | Kerberos DNS discovery | 5s |
+| `w32tm /stripchart` | Clock skew measurement | 5s |
+| `ipconfig /all` | DNS servers and suffix | 15s |
 | `cmdkey /list` | Credential Manager query | 15s |
-| `net use` / `net use /delete` | Share access test | 10s / 5s |
-| `powershell Get-SmbServerConfiguration` | SMB version check | 15s |
+| `tpmtool getdeviceinformation` | TPM detection | 5s |
+| `net use` / `net use /delete` | Share access test | 8s / 3s |
 
-All launched with `CreateNoWindow`, `UseShellExecute=false`, `RedirectStandardOutput`, killed on timeout.
+All launched with `CreateNoWindow`, `UseShellExecute=false`, `RedirectStandardOutput`, async stdout read, killed on timeout.
 
 ## Build from Source
 
@@ -139,4 +179,5 @@ Output: `bin/Release/net8.0-windows/win-x64/publish/smb-diag.exe`
 
 | Version | Date | Changes |
 |---|---|---|
+| v1.1.0 | 2026-07-10 | Scenario auto-detection on startup, scenario-aware test skeletons, real-time streaming results, parallel test execution, troubleshooting guide with Fix tips per test, run history (5 per scenario), TPM/WHfB Config/Cloud AP/MDM/Secure Channel tests, registry-based SMB version detection, single-instance mutex, SSPI buffer zeroing, process lifecycle cleanup, reduced timeouts |
 | v1.0.0 | 2026-07-09 | Initial release — dual-scenario diagnostics, SSPI negotiation testing, persistent input history, guide tabs, export |

@@ -13,6 +13,7 @@ using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -25,6 +26,13 @@ static class Program
     [STAThread]
     static void Main()
     {
+        using var mutex = new Mutex(true, "Global\\SmbDiag_SingleInstance", out bool isNew);
+        if (!isNew)
+        {
+            MessageBox.Show("SMB Auth Diagnostics is already running.", "SMB Diag",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Application.Run(new MainForm());
@@ -61,16 +69,20 @@ class MainForm : Form
     static readonly Font TabFontInactive = new("Segoe UI", 8.5f);
 
     readonly ComboBox _txtServer, _txtDomain, _txtDc, _txtShare;
-    readonly ComboBox _cboScenario;
-    readonly Button _btnRun, _btnExport, _btnClear, _btnTabResults, _btnTabGuide;
+    readonly Button _btnAD, _btnEntra;
+    int _scenarioIndex;
+    readonly CheckBox _chkPurge;
+    readonly Button _btnRun, _btnExport, _btnClear, _btnOpenShare, _btnTabResults, _btnTabGuide;
     readonly Label _lblStatus, _lblPassCount, _lblFailCount, _lblWarnCount;
-    readonly Panel _summaryPanel, _resultsCanvas, _resultsScrollPanel;
+    readonly Panel _summaryPanel, _resultsCanvas, _resultsScrollPanel, _historyPanel;
     readonly RichTextBox _guideBox;
     List<TestGroup>? _lastResults;
     List<TestGroup>? _renderedGroups;
     bool _renderRunning;
     string? _placeholderText;
-    readonly Dictionary<int, List<TestGroup>> _resultsByScenario = new();
+    readonly Dictionary<int, List<DiagRun>> _runHistory = new() { [0] = [], [1] = [] };
+    int _selectedRunIndex = -1;
+    CancellationTokenSource? _runCts;
 
     static string SettingsPath => Path.Combine(AppContext.BaseDirectory, "smb-diag-settings.json");
 
@@ -84,6 +96,8 @@ class MainForm : Form
         ForeColor = TextColor;
         Font = new Font("Segoe UI", 9f);
         DoubleBuffered = true;
+        var icoPath = Path.Combine(AppContext.BaseDirectory, "app.ico");
+        if (File.Exists(icoPath)) Icon = new Icon(icoPath);
 
         var mainPanel = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = Padding.Empty };
         var layout = new TableLayoutPanel
@@ -106,22 +120,28 @@ class MainForm : Form
         var header = new Panel { Height = 34, Dock = DockStyle.Fill };
         header.Paint += (s, e) => e.Graphics.DrawLine(BorderPen, 0, header.Height - 1, header.Width, header.Height - 1);
         var lblTitle = new Label { Text = "SMB Auth Diagnostics", ForeColor = TextColor, Font = new Font("Segoe UI", 11f, FontStyle.Bold), AutoSize = true, Location = new Point(10, 6) };
-        var lblTag = new Label { Text = " v1.0.0 ", ForeColor = AccentColor, BackColor = AccentDimColor, Font = new Font("Segoe UI", 7.5f, FontStyle.Bold), AutoSize = true, Location = new Point(192, 10) };
-        _cboScenario = new ComboBox
+        var lblTag = new Label { Text = " v1.1.0 ", ForeColor = AccentColor, BackColor = AccentDimColor, Font = new Font("Segoe UI", 7.5f, FontStyle.Bold), AutoSize = true, Location = new Point(192, 10) };
+        _btnAD = new Button
         {
-            DropDownStyle = ComboBoxStyle.DropDownList,
-            BackColor = SurfaceColor, ForeColor = TextColor,
-            FlatStyle = FlatStyle.Standard,
-            Font = new Font("Segoe UI", 8.5f),
-            Location = new Point(240, 5),
+            Text = "AD Joined", FlatStyle = FlatStyle.Flat,
+            Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+            Size = new Size(100, 24), Location = new Point(240, 5), Cursor = Cursors.Hand,
         };
-        _cboScenario.Items.AddRange([
-            "AD Joined (on-prem or VPN)",
-            "Entra Joined (cloud, no NTLM)"
-        ]);
-        _cboScenario.SelectedIndex = 0;
-        _cboScenario.SelectedIndexChanged += CboScenario_Changed;
-        header.Controls.AddRange([lblTitle, lblTag, _cboScenario]);
+        _btnAD.FlatAppearance.BorderSize = 0;
+        _btnAD.Click += (s, e) => SetScenario(0);
+
+        _btnEntra = new Button
+        {
+            Text = "Entra Joined", FlatStyle = FlatStyle.Flat,
+            Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+            Size = new Size(110, 24), Location = new Point(344, 5), Cursor = Cursors.Hand,
+        };
+        _btnEntra.FlatAppearance.BorderSize = 0;
+        _btnEntra.Click += (s, e) => SetScenario(1);
+
+        _scenarioIndex = 0;
+        StyleScenarioButtons();
+        header.Controls.AddRange([lblTitle, lblTag, _btnAD, _btnEntra]);
         layout.Controls.Add(header, 0, 0);
 
         // Config
@@ -142,11 +162,18 @@ class MainForm : Form
         _btnExport = new Button { Text = "Export Results", BackColor = SurfaceColor, ForeColor = DimColor, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9f), Size = new Size(110, 26), Location = new Point(148, 4), Enabled = false, Cursor = Cursors.Hand };
         _btnExport.FlatAppearance.BorderColor = BorderColor;
         _btnExport.Click += BtnExport_Click;
-        _btnClear = new Button { Text = "Clear", BackColor = SurfaceColor, ForeColor = DimColor, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9f), Size = new Size(60, 26), Location = new Point(266, 4), Cursor = Cursors.Hand };
+        _btnClear = new Button { Text = "Clear Results", BackColor = SurfaceColor, ForeColor = DimColor, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9f), Size = new Size(100, 26), Location = new Point(266, 4), Cursor = Cursors.Hand };
         _btnClear.FlatAppearance.BorderColor = BorderColor;
         _btnClear.Click += BtnClear_Click;
-        _lblStatus = new Label { ForeColor = DimColor, Font = new Font("Segoe UI", 8.5f), AutoSize = true, Location = new Point(336, 10) };
-        actionsPanel.Controls.AddRange([_btnRun, _btnExport, _btnClear, _lblStatus]);
+        var btnReset = new Button { Text = "Reset All", BackColor = SurfaceColor, ForeColor = FailColor, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9f), Size = new Size(75, 26), Location = new Point(374, 4), Cursor = Cursors.Hand };
+        btnReset.FlatAppearance.BorderColor = BorderColor;
+        btnReset.Click += BtnReset_Click;
+        _btnOpenShare = new Button { Text = "Open Share", BackColor = SurfaceColor, ForeColor = DimColor, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9f), Size = new Size(90, 26), Location = new Point(457, 4), Cursor = Cursors.Hand, Enabled = false };
+        _btnOpenShare.FlatAppearance.BorderColor = BorderColor;
+        _btnOpenShare.Click += BtnOpenShare_Click;
+        _chkPurge = new CheckBox { Text = "Purge tickets", ForeColor = DimColor, Font = new Font("Segoe UI", 8f), AutoSize = true, Location = new Point(555, 7), FlatStyle = FlatStyle.Flat };
+        _lblStatus = new Label { ForeColor = DimColor, Font = new Font("Segoe UI", 8.5f), AutoSize = true, Location = new Point(670, 10) };
+        actionsPanel.Controls.AddRange([_btnRun, _btnExport, _btnClear, btnReset, _btnOpenShare, _chkPurge, _lblStatus]);
         layout.Controls.Add(actionsPanel, 0, 2);
 
         // Summary bar
@@ -210,8 +237,12 @@ class MainForm : Form
         };
         PopulateGuide();
 
+        _historyPanel = new Panel { Height = 28, Dock = DockStyle.Top, BackColor = BgColor, Visible = false };
+        _historyPanel.Paint += (s, e) => e.Graphics.DrawLine(BorderPen, 0, _historyPanel.Height - 1, _historyPanel.Width, _historyPanel.Height - 1);
+
         contentWrapper.Controls.Add(_resultsScrollPanel);
         contentWrapper.Controls.Add(_guideBox);
+        contentWrapper.Controls.Add(_historyPanel);
         contentWrapper.Controls.Add(tabBar);
         layout.Controls.Add(contentWrapper, 0, 4);
 
@@ -220,17 +251,21 @@ class MainForm : Form
 
         _placeholderText = "Enter target details and run diagnostics";
 
-        header.Resize += (s, e) => _cboScenario.Width = header.ClientSize.Width - _cboScenario.Left - 10;
         Load += (s, e) =>
         {
             _resultsCanvas.Width = _resultsScrollPanel.ClientSize.Width;
             _resultsCanvas.Height = MeasureResultsHeight(_resultsCanvas.Width);
             _resultsCanvas.Invalidate();
-            _cboScenario.Width = header.ClientSize.Width - _cboScenario.Left - 10;
         };
 
         LoadSettings();
-        FormClosing += (s, e) => SaveSettings();
+        FormClosing += (s, e) =>
+        {
+            _runCts?.Cancel();
+            SaveSettings();
+        };
+        FormClosed += (s, e) => Environment.Exit(0);
+        _ = DetectScenarioAsync();
     }
 
     ComboBox MakeInput(Panel parent, string label, int col, int row)
@@ -286,8 +321,30 @@ class MainForm : Form
             LoadComboHistory(_txtDc, s, "dc");
             LoadComboHistory(_txtShare, s, "share");
 
-            if (s.TryGetValue("scenario", out var sc) && sc.TryGetInt32(out int idx) && idx >= 0 && idx < _cboScenario.Items.Count)
-                _cboScenario.SelectedIndex = idx;
+            if (s.TryGetValue("scenario", out var sc) && sc.TryGetInt32(out int idx) && idx >= 0 && idx <= 1)
+            {
+                _scenarioIndex = idx;
+                StyleScenarioButtons();
+            }
+        }
+        catch { }
+    }
+
+    async Task DetectScenarioAsync()
+    {
+        try
+        {
+            string dsreg = await Task.Run(() => RunProcess("dsregcmd", "/status", timeoutMs: 5000));
+            if (IsDisposed) return;
+            bool aadJoined = Regex.IsMatch(dsreg, @"AzureAdJoined\s*:\s*YES", RegexOptions.IgnoreCase);
+            bool domJoined = Regex.IsMatch(dsreg, @"DomainJoined\s*:\s*YES", RegexOptions.IgnoreCase);
+            int detected = aadJoined && !domJoined ? 1 : 0;
+            if (detected != _scenarioIndex)
+            {
+                _scenarioIndex = detected;
+                StyleScenarioButtons();
+                PopulateGuide();
+            }
         }
         catch { }
     }
@@ -332,7 +389,7 @@ class MainForm : Form
                 ["domain"] = ComboHistory(_txtDomain),
                 ["dc"] = ComboHistory(_txtDc),
                 ["share"] = ComboHistory(_txtShare),
-                ["scenario"] = _cboScenario.SelectedIndex,
+                ["scenario"] = _scenarioIndex,
             };
             File.WriteAllText(SettingsPath, JsonSerializer.Serialize(s, new JsonSerializerOptions { WriteIndented = true }));
         }
@@ -369,12 +426,66 @@ class MainForm : Form
 
     void BtnClear_Click(object? sender, EventArgs e)
     {
+        _runHistory[0].Clear();
+        _runHistory[1].Clear();
+        _selectedRunIndex = -1;
+        _lastResults = null;
+        _renderedGroups = null;
+        _placeholderText = "Enter target details and run diagnostics";
+        _resultsCanvas.Height = 200;
+        _resultsCanvas.Invalidate();
+        _summaryPanel.Visible = false;
+        _btnExport.Enabled = false;
+        _btnOpenShare.Enabled = false;
+        RebuildHistoryBar();
+        _lblStatus.Text = "Results cleared";
+    }
+
+    void BtnReset_Click(object? sender, EventArgs e)
+    {
+        var result = MessageBox.Show(
+            "This will clear all saved server history, input fields, results, and settings.\n\nContinue?",
+            "Reset All", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+        if (result != DialogResult.Yes) return;
+
         _txtServer.Items.Clear(); _txtServer.Text = "";
         _txtDomain.Items.Clear(); _txtDomain.Text = "";
         _txtDc.Items.Clear(); _txtDc.Text = "";
         _txtShare.Items.Clear(); _txtShare.Text = "";
+        BtnClear_Click(sender, e);
         try { if (File.Exists(SettingsPath)) File.Delete(SettingsPath); } catch { }
-        _lblStatus.Text = "Settings cleared";
+        _lblStatus.Text = "All settings reset";
+    }
+
+    void BtnOpenShare_Click(object? sender, EventArgs e)
+    {
+        string server = _txtServer.Text.Trim();
+        string share = _txtShare.Text.Trim();
+        if (string.IsNullOrEmpty(server))
+        {
+            _lblStatus.Text = "File server is required";
+            return;
+        }
+        if (!HostnamePattern.IsMatch(server))
+        {
+            _lblStatus.Text = "Invalid server hostname";
+            return;
+        }
+        if (!string.IsNullOrEmpty(share) && !ShareNamePattern.IsMatch(share))
+        {
+            _lblStatus.Text = "Invalid share name";
+            return;
+        }
+        string uncPath = string.IsNullOrEmpty(share) ? $@"\\{server}" : $@"\\{server}\{share}";
+        try
+        {
+            Process.Start(new ProcessStartInfo { FileName = uncPath, UseShellExecute = true });
+            _lblStatus.Text = $"Opened {uncPath}";
+        }
+        catch (Exception ex)
+        {
+            _lblStatus.Text = $"Cannot open: {ex.Message}";
+        }
     }
 
     // ── Tab switching ───────────────────────────────────────
@@ -393,18 +504,60 @@ class MainForm : Form
 
     // ── Guide content ───────────────────────────────────────
 
+    static readonly Font GuideTestNameFont = new("Segoe UI", 9.5f, FontStyle.Bold);
+    static readonly Font GuideBodyFont = new("Segoe UI", 9f);
+    static readonly Font GuideFixFont = new("Segoe UI", 8.5f);
+    static readonly Font GuideFixLabelFont = new("Segoe UI", 8.5f, FontStyle.Bold);
+    static readonly Color FixLabelColor = Color.FromArgb(0xfb, 0xbf, 0x24);
+
     void PopulateGuide()
     {
         _guideBox.Clear();
-        bool isEntra = _cboScenario.SelectedIndex == 1;
+        bool isEntra = _scenarioIndex == 1;
         string scenario = isEntra ? "Entra Joined" : "AD Joined";
 
         AppendGuide($"{scenario} — Test Guide\n\n", new Font("Segoe UI", 12f, FontStyle.Bold), AccentColor);
 
         foreach (var (title, body) in GetGuideSections(isEntra))
         {
-            AppendGuide($"{title}\n", new Font("Segoe UI", 10f, FontStyle.Bold), TextColor);
-            AppendGuide($"{body}\n\n", new Font("Segoe UI", 9.5f), DimColor);
+            AppendGuide($"\n{title}\n", new Font("Segoe UI", 10.5f, FontStyle.Bold), TextColor);
+            AppendGuide("─────────────────────────────────────────\n\n", GuideBodyFont, BorderColor);
+
+            var lines = body.Split('\n');
+            foreach (var line in lines)
+            {
+                if (string.IsNullOrWhiteSpace(line))
+                    continue;
+
+                if (line.StartsWith("• "))
+                {
+                    int dash = line.IndexOf(" — ", StringComparison.Ordinal);
+                    if (dash > 0)
+                    {
+                        AppendGuide(line[..(dash + 3)], GuideTestNameFont, AccentColor);
+                        AppendGuide(line[(dash + 3)..] + "\n", GuideBodyFont, TextColor);
+                    }
+                    else
+                    {
+                        AppendGuide(line + "\n", GuideTestNameFont, AccentColor);
+                    }
+                }
+                else if (line.TrimStart().StartsWith("Fix:"))
+                {
+                    string trimmed = line.TrimStart();
+                    AppendGuide("  Fix: ", GuideFixLabelFont, FixLabelColor);
+                    AppendGuide(trimmed[5..].TrimStart() + "\n\n", GuideFixFont, DimColor);
+                }
+                else if (line.TrimStart().StartsWith("- "))
+                {
+                    AppendGuide("    " + line.TrimStart() + "\n", GuideBodyFont, DimColor);
+                }
+                else
+                {
+                    AppendGuide(line + "\n", GuideBodyFont, DimColor);
+                }
+            }
+            AppendGuide("\n", GuideBodyFont, DimColor);
         }
 
         _guideBox.SelectionStart = 0;
@@ -427,103 +580,173 @@ class MainForm : Form
         if (isEntra)
         {
             s.Add(("Identity & Device",
-                "Uses dsregcmd /status to verify Azure AD join state.\n" +
+                "Uses dsregcmd /status to verify Azure AD join state.\n\n" +
                 "• AzureAdJoined — must be YES for Entra authentication\n" +
+                "  Fix: Run 'dsregcmd /join' or re-join via Settings > Accounts > Access work or school. Verify the device object exists in Entra ID portal\n\n" +
                 "• CloudTgt — Cloud Kerberos Trust must be enabled for SSO to on-prem resources\n" +
+                "  Fix: Enable CKT in Intune via device config policy (Authentication > Enable Cloud Kerberos Trust). Ensure the Entra Kerberos server object exists in AD — run 'Get-AzureADKerberosServer' to check\n\n" +
                 "• OnPremTgt — proves CKT is successfully issuing on-prem TGTs via Azure AD\n" +
+                "  Fix: If CloudTgt is YES but OnPremTgt is NO, the Entra Kerberos server object may be stale. Re-run 'Set-AzureADKerberosServer' to refresh it. Also verify line-of-sight to a DC\n\n" +
+                "• Logged-on User — shows the Windows identity\n" +
+                "  Fix: If showing a local account instead of an Entra identity, sign out and sign in with your Entra (Azure AD) account\n\n" +
+                "• WHfB Status — Windows Hello enrollment is expected for Entra-joined devices\n" +
+                "  Fix: Enroll via Settings > Accounts > Sign-in options > Windows Hello. If greyed out, check Intune policy and TPM availability\n\n" +
+                "• TPM Status — Trusted Platform Module required for WHfB key storage. Detected via tpmtool, registry, Get-Tpm, and ACPI device\n" +
+                "  Fix: Enable TPM in BIOS/UEFI. For VMs, enable vTPM in hypervisor settings. Run 'tpmtool getdeviceinformation' for details\n\n" +
+                "• WHfB Config — shows trust model (Cloud Kerberos Trust, Certificate Trust, or Key Trust), TPM policy, and enrolled credential types\n" +
+                "  Fix: If trust model is wrong, update Intune WHfB policy. Cloud Kerberos Trust is recommended for Entra-joined devices\n\n" +
                 "• PRT (Primary Refresh Token) — required for seamless SSO to both cloud and on-prem\n" +
-                "• WHfB — Windows Hello enrollment is expected for Entra-joined devices"));
+                "  Fix: Run 'dsregcmd /refreshprt'. If that fails, try lock/unlock or sign out and back in. Check for expired user certificates or conditional access blocks\n\n" +
+                "• Cloud AP Plugin — verifies the Azure AD CloudAP authentication plugin is active (required for PRT and CKT)\n" +
+                "  Fix: Run 'dsregcmd /status' and look for the PRT section. If missing, restart the 'TokenBroker' service or reboot. Reinstall the device certificate if corrupt\n\n" +
+                "• MDM Enrollment — checks Intune/MDM enrollment and compliance state. Conditional Access may block non-compliant devices\n" +
+                "  Fix: Enroll via Settings > Accounts > Access work or school > Enroll in device management. If enrolled but non-compliant, check Intune compliance policies for the failing rule"));
 
             s.Add(("Kerberos Tickets",
-                "Runs 'klist' to examine the Kerberos ticket cache. For Entra devices, tickets are issued via Cloud Kerberos Trust rather than direct KDC contact.\n" +
+                "Runs 'klist' to examine the Kerberos ticket cache. For Entra devices, tickets are issued via Cloud Kerberos Trust rather than direct KDC contact.\n\n" +
+                "• Ticket Purge — when 'Purge tickets' is checked, runs 'klist purge' before testing to force fresh ticket acquisition\n" +
+                "  Fix: If tickets fail to reacquire after purge, the auth chain is broken — check PRT, CKT, and DC connectivity\n\n" +
                 "• TGT Present — a krbtgt ticket proves the cloud-to-on-prem trust chain is working\n" +
+                "  Fix: No TGT usually means CKT is not configured or the Entra Kerberos server object is missing/stale. Run 'klist get krbtgt' to attempt acquisition and see the error\n\n" +
                 "• TGT Expiry — ensures the ticket hasn't expired (typically 10 hours)\n" +
+                "  Fix: Lock and unlock the workstation to trigger PRT refresh and new ticket issuance. Check if the user's account is locked or disabled in Entra\n\n" +
                 "• cifs/ Service Ticket — a cached ticket for the file server means auth has succeeded\n" +
-                "• Ticket Encryption — AES-256 preferred; RC4 may indicate legacy configuration"));
+                "  Fix: If TGT is present but no cifs/ ticket, verify the file server's SPN is registered in AD and DNS resolves correctly. Try: 'klist get cifs/<server>'\n\n" +
+                "• Ticket Encryption — AES-256 preferred; RC4 may indicate legacy configuration\n" +
+                "  Fix: Enable AES on the file server's AD computer account (Properties > Account > check AES 256). Update SupportedEncryptionTypes in GPO"));
 
             s.Add(("SSPI / SPNEGO Negotiation",
-                "Uses Windows SSPI API (secur32.dll) to acquire Negotiate credentials and generate a SPNEGO token. Tests the complete client-side authentication pipeline without needing a server response.\n\n" +
-                "Calls AcquireCredentialsHandle with 'Negotiate' package, then InitializeSecurityContext with ISC_REQ_MUTUAL_AUTH | ISC_REQ_DELEGATE flags (matching real SMB client behavior).\n\n" +
-                "• Token > 256 bytes → Kerberos (SPNEGO-wrapped AP-REQ with service ticket and authenticator)\n" +
-                "• Token ≤ 256 bytes → NTLM fallback (Type 1 negotiate message)\n\n" +
-                "SEC_I_CONTINUE_NEEDED (0x00090312) is expected — it means the client generated its half of the handshake. Generating a token at all confirms the auth stack is functional."));
+                "Uses Windows SSPI API to acquire Negotiate credentials and generate a SPNEGO token. Tests the client-side auth pipeline without a server response.\n\n" +
+                "• Token > 256 bytes → Kerberos (SPNEGO-wrapped AP-REQ)\n" +
+                "• Token ≤ 256 bytes → NTLM fallback (Type 1 negotiate)\n\n" +
+                "SEC_I_CONTINUE_NEEDED (0x00090312) is expected — the client generated its half of the handshake.\n\n" +
+                "Fix: If NTLM fallback occurs, check that a cifs/ service ticket was obtained (Kerberos Tickets section). Common causes: SPN not registered, DNS returning an IP instead of FQDN, or target name mismatch. If no token is generated at all, the credential store may be empty — check PRT status"));
 
             s.Add(("Network Path",
-                "Tests connectivity to services required for SMB authentication:\n" +
+                "Tests connectivity to services required for SMB authentication:\n\n" +
                 "• DNS Resolution — resolves the file server FQDN to IP addresses\n" +
+                "  Fix: Run 'nslookup <server>'. If it fails, check DNS server config and verify the A/AAAA record exists. For split-DNS, ensure VPN is connected\n\n" +
                 "• Port 445 (SMB) — direct SMB/CIFS file sharing port\n" +
+                "  Fix: Check firewall rules on the client and server. Verify the Server service is running on the target. Test with 'Test-NetConnection <server> -Port 445'\n\n" +
                 "• Port 88 (Kerberos) — KDC port; unreachable is only a WARNING since Entra uses Cloud KDC\n" +
+                "  Fix: For Entra, this is expected if no VPN/line-of-sight to DC. If on VPN and still blocked, check firewall rules to the DC\n\n" +
                 "• Port 389 (LDAP) — directory services for group policy and lookups\n" +
-                "• Clock Skew — Kerberos has a strict 5-minute tolerance; beyond this breaks authentication"));
+                "  Fix: Ensure the DC is reachable. Check VPN routing and firewall rules for LDAP traffic\n\n" +
+                "• Clock Skew — Kerberos has a strict 5-minute tolerance\n" +
+                "  Fix: Run 'w32tm /resync'. Check that the Windows Time service (W32Time) is running and the NTP source is correct: 'w32tm /query /status'\n\n" +
+                "• DNS Servers — shows configured DNS servers from ipconfig\n" +
+                "  Fix: Verify DNS servers can resolve the target domain. For VPN, ensure the tunnel pushes the correct DNS servers. Run 'ipconfig /all' to review\n\n" +
+                "• DNS Suffix — checks if the target domain is in the DNS suffix search list\n" +
+                "  Fix: Add the domain to the DNS suffix search list via GPO, Intune, or VPN adapter settings. Without it, short hostnames won't resolve\n\n" +
+                "• IPv6 Status — detects dual-stack vs IPv6-only. IPv6-only can fail silently if routing is incomplete\n" +
+                "  Fix: If IPv6-only and SMB fails, try disabling IPv6 on the network adapter temporarily to force IPv4. Long-term, fix IPv6 routing or DNS to include A records"));
 
             s.Add(("SMB Configuration",
-                "Checks Windows SMB client settings:\n" +
+                "Checks Windows SMB client settings:\n\n" +
                 "• SMB Signing — 'Required' is most secure, prevents MITM on SMB sessions\n" +
+                "  Fix: Set via GPO: Computer Config > Policies > Windows Settings > Security Settings > Local Policies > Security Options > 'Microsoft network client: Digitally sign communications (always)'\n\n" +
                 "• SMB Versions — SMBv1 should be disabled (security risk); SMBv2/3 should be enabled\n" +
-                "• Share Access Test — attempts 'net use' to the configured share and disconnects\n\n" +
-                "LmCompatibilityLevel is not checked for Entra since NTLM negotiation is handled differently through cloud trust."));
+                "  Fix: Disable SMBv1: 'Set-SmbServerConfiguration -EnableSMB1Protocol $false'. If SMBv2 is disabled, enable it: 'Set-SmbServerConfiguration -EnableSMB2Protocol $true'\n\n" +
+                "• Guest Fallback — AllowInsecureGuestAuth registry setting. When disabled (default), anonymous/guest access silently fails with a generic access error\n" +
+                "  Fix: If you need guest access (not recommended), set HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanWorkstation\\Parameters\\AllowInsecureGuestAuth to 1. Better fix: configure proper authentication on the share\n\n" +
+                "• Share Access Test — attempts 'net use' to the configured share and disconnects\n" +
+                "  Fix: If all other tests pass but share access fails, check share-level permissions (not just NTFS). Verify the share name is correct and the server's firewall allows SMB"));
 
             s.Add(("Credential Store",
-                "Tests NTLM hash availability by generating an NTLM token via SSPI 'NTLM' package:\n" +
-                "• Acquires NTLM credentials and calls InitializeSecurityContext\n" +
-                "• Token generated → NTLM password hash IS cached in memory\n" +
-                "• For Entra-only: hash present = WARNING (unexpected)\n" +
-                "• For Entra-only: hash absent = PASS (expected behavior)\n\n" +
-                "Credential Manager is not checked for Entra scenarios."));
+                "Tests NTLM hash availability via SSPI:\n\n" +
+                "• NTLM Hash Available — generates an NTLM token to test whether the password hash is cached\n" +
+                "  - Hash present = WARNING — this is a non-AD local/Entra password hash, not a domain hash\n" +
+                "  - Hash absent = PASS (expected for Entra)\n\n" +
+                "  Fix: If hash is present unexpectedly, the user may have signed in with a password instead of WHfB. Re-enroll WHfB and sign in with PIN/biometric to clear the cached hash on next logon"));
         }
         else
         {
             s.Add(("Identity & Device",
-                "Uses dsregcmd /status to check domain join status and device identity:\n" +
+                "Uses dsregcmd /status to check domain join status and device identity:\n\n" +
                 "• DomainJoined — must be YES for on-prem AD authentication\n" +
+                "  Fix: Join the domain via Settings > Accounts > Access work or school > Connect > Join this device to a local Active Directory domain. Verify network connectivity to a DC first\n\n" +
                 "• Logged-on User — shows the Windows identity (DOMAIN\\user)\n" +
-                "• WHfB Status — Windows Hello for Business enrollment; when enabled, NTLM password hash may not be cached, which can break NTLM fallback authentication"));
+                "  Fix: If showing a local account, sign out and sign in with domain credentials. If the domain isn't available, check VPN or network connectivity to a DC\n\n" +
+                "• WHfB Status — Windows Hello enrollment; when enabled, NTLM password hash may not be cached, which can break NTLM fallback\n" +
+                "  Fix: If WHfB is causing NTLM failures, configure the 'Allow NTLM hash' WHfB policy via GPO or Intune so the password hash is cached alongside the WHfB credential\n\n" +
+                "• TPM Status — Trusted Platform Module required for WHfB key storage. Detected via tpmtool, registry, Get-Tpm, and ACPI device\n" +
+                "  Fix: Enable TPM in BIOS/UEFI. For VMs, enable vTPM in hypervisor settings. Run 'tpmtool getdeviceinformation' for details\n\n" +
+                "• WHfB Config — shows trust model (Cloud Kerberos Trust, Certificate Trust, or Key Trust), TPM policy, and enrolled credential types\n" +
+                "  Fix: If trust model is wrong, update GPO or Intune WHfB policy. For hybrid environments, Cloud Kerberos Trust is simplest"));
 
             s.Add(("Kerberos Tickets",
-                "Runs 'klist' to examine the Kerberos ticket cache:\n" +
+                "Runs 'klist' to examine the Kerberos ticket cache:\n\n" +
+                "• Ticket Purge — when 'Purge tickets' is checked, runs 'klist purge' before testing to force fresh ticket acquisition\n" +
+                "  Fix: If tickets fail to reacquire after purge, the KDC is unreachable or credentials are invalid. Check DC connectivity and account status\n\n" +
                 "• TGT Present — krbtgt/REALM ticket proves the client has contacted the KDC\n" +
+                "  Fix: Run 'klist get krbtgt' to attempt acquisition. If it fails, check Port 88 connectivity to the DC, DNS SRV records, and that the account isn't locked\n\n" +
                 "• TGT Expiry — ensures the ticket hasn't expired (typically 10h, renewable 7 days)\n" +
+                "  Fix: Lock and unlock the workstation, or run 'klist get krbtgt' to renew. If renewal fails, the ticket lifetime policy may need adjustment in AD\n\n" +
                 "• cifs/ Service Ticket — a cached ticket for the file server means Kerberos auth succeeded\n" +
-                "• Ticket Encryption — AES-256 preferred; RC4-HMAC indicates legacy or misconfigured encryption\n\n" +
-                "Note: klist dates on Windows include a '(local)' suffix which is stripped before parsing."));
+                "  Fix: If TGT is present but no cifs/ ticket, the SPN may not be registered. Run 'setspn -Q cifs/<server>' (requires elevation). Also verify the server FQDN matches the SPN exactly\n\n" +
+                "• Ticket Encryption — AES-256 preferred; RC4-HMAC indicates legacy or misconfigured encryption\n" +
+                "  Fix: Enable AES on the file server's AD computer account and update GPO SupportedEncryptionTypes to include AES (0x18 or higher)"));
 
             s.Add(("Kerberos Configuration",
-                "Checks Active Directory and client Kerberos settings:\n" +
-                "• SPN Registration — verifies cifs/<server> registered in AD via 'setspn -Q'. Requires elevation; falls back to verifying a cached service ticket\n" +
-                "• Allowed Enc Types — registry SupportedEncryptionTypes: 0x18 = AES. No AES may cause auth failures with modern DCs\n" +
-                "• Max Token Size — users in many groups need ≥48000 bytes. Too low causes Kerberos failures for heavily-grouped accounts\n" +
-                "• DNS SRV Records — _kerberos._tcp.<domain> must resolve for automatic KDC discovery"));
+                "Checks Active Directory and client Kerberos settings:\n\n" +
+                "• SPN Registration — verifies cifs/<server> registered in AD via 'setspn -Q'\n" +
+                "  Fix: Register the SPN: 'setspn -S cifs/<server-fqdn> <computer-account>' (domain admin required). Check for duplicate SPNs with 'setspn -X'\n\n" +
+                "• Allowed Enc Types — registry SupportedEncryptionTypes: 0x18 = AES\n" +
+                "  Fix: Set via GPO: Computer Config > Policies > Windows Settings > Security Settings > Local Policies > Security Options > 'Network security: Configure encryption types allowed for Kerberos'\n\n" +
+                "• Max Token Size — users in many groups need ≥48000 bytes\n" +
+                "  Fix: Increase MaxTokenSize in registry: HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Kerberos\\Parameters\\MaxTokenSize (DWORD, set to 65535). Also consider reducing group membership\n\n" +
+                "• DNS SRV Records — _kerberos._tcp.<domain> must resolve for automatic KDC discovery\n" +
+                "  Fix: Verify with 'nslookup -type=SRV _kerberos._tcp.<domain>'. If missing, check DNS zone replication and that the DC registered its SRV records (run 'nltest /dsregdns' on the DC)"));
 
             s.Add(("SSPI / SPNEGO Negotiation",
-                "Uses Windows SSPI API (secur32.dll) to acquire Negotiate credentials and generate a SPNEGO token. Tests the complete client-side authentication pipeline without needing a server response.\n\n" +
-                "Calls AcquireCredentialsHandle with 'Negotiate' package, then InitializeSecurityContext with ISC_REQ_MUTUAL_AUTH | ISC_REQ_DELEGATE flags (matching real SMB client behavior).\n\n" +
-                "• Token > 256 bytes → Kerberos (SPNEGO-wrapped AP-REQ with service ticket and authenticator)\n" +
-                "• Token ≤ 256 bytes → NTLM fallback (Type 1 negotiate message)\n\n" +
-                "SEC_I_CONTINUE_NEEDED (0x00090312) is expected — the client generated its half of the handshake. Generating a token at all confirms the auth stack is functional."));
+                "Uses Windows SSPI API to acquire Negotiate credentials and generate a SPNEGO token. Tests the client-side auth pipeline without a server response.\n\n" +
+                "• Token > 256 bytes → Kerberos (SPNEGO-wrapped AP-REQ)\n" +
+                "• Token ≤ 256 bytes → NTLM fallback (Type 1 negotiate)\n\n" +
+                "SEC_I_CONTINUE_NEEDED (0x00090312) is expected — the client generated its half of the handshake.\n\n" +
+                "Fix: If NTLM fallback occurs, check that a cifs/ service ticket was obtained. Common causes: SPN not registered, DNS returning IP instead of FQDN, or accessing the server by IP (Kerberos requires hostname). If no token generated, check that the user has valid domain credentials"));
 
             s.Add(("Network Path",
-                "Tests connectivity to services required for Kerberos and SMB:\n" +
+                "Tests connectivity to services required for Kerberos and SMB:\n\n" +
                 "• DNS Resolution — resolves the file server FQDN to IPv4 addresses\n" +
+                "  Fix: Run 'nslookup <server>'. If it fails, check DNS server config and verify the A record exists in the domain's DNS zone\n\n" +
                 "• Port 445 (SMB) — direct SMB/CIFS file sharing\n" +
+                "  Fix: Check firewall rules on both client and server. Verify the Server service is running. Test: 'Test-NetConnection <server> -Port 445'\n\n" +
                 "• Port 88 (Kerberos) — KDC port; unreachable = no Kerberos possible\n" +
+                "  Fix: Verify DC is reachable and firewall allows TCP/UDP 88. Run 'nltest /dsgetdc:<domain>' to find the nearest DC\n\n" +
                 "• Port 389 (LDAP) — directory services\n" +
+                "  Fix: Check firewall rules and DC availability. LDAP is required for group policy and AD lookups\n\n" +
                 "• Port 464 (kpasswd) — Kerberos password change service\n" +
-                "• Clock Skew — measured via w32tm against DC. Kerberos 5-minute tolerance; beyond causes SEC_E_TIMESTAMP_INVALID"));
+                "  Fix: Usually blocked by firewalls in remote/VPN scenarios. Not critical for auth but needed for password changes via Kerberos\n\n" +
+                "• Clock Skew — measured via w32tm against DC. Kerberos 5-minute tolerance\n" +
+                "  Fix: Run 'w32tm /resync'. Ensure W32Time service is running and configured to sync from the domain hierarchy: 'w32tm /query /status'\n\n" +
+                "• DNS Servers — shows configured DNS servers from ipconfig\n" +
+                "  Fix: AD-joined machines should use AD-integrated DNS servers. If using external DNS, Kerberos SRV records won't resolve. Update NIC DNS settings or DHCP scope\n\n" +
+                "• DNS Suffix — verifies target domain is in the DNS suffix search list\n" +
+                "  Fix: Add domain to suffix search list via GPO (Computer Config > Admin Templates > Network > DNS Client > DNS Suffix Search List) or on the NIC: Advanced TCP/IP > DNS tab\n\n" +
+                "• IPv6 Status — detects dual-stack vs IPv6-only. IPv6-only may cause silent SMB failures\n" +
+                "  Fix: If IPv6-only and SMB fails, check IPv6 routing to the file server. Temporarily disable IPv6 on the adapter to test. Long-term, ensure DNS has both A and AAAA records"));
 
             s.Add(("SMB Configuration",
-                "Checks Windows SMB client and security settings:\n" +
-                "• LmCompatibility Level — Level 3+ (NTLMv2 only) recommended. Levels 0–2 allow weaker LM/NTLM\n" +
-                "• SMB Signing — 'Required' prevents MITM attacks. 'Enabled' allows but doesn't enforce\n" +
-                "• SMB Versions — SMBv1 should be disabled (EternalBlue). SMBv2/3 required for modern security\n" +
-                "• Share Access Test — attempts 'net use' to the configured UNC path and disconnects"));
+                "Checks Windows SMB client and security settings:\n\n" +
+                "• LmCompatibility Level — Level 3+ (NTLMv2 only) recommended\n" +
+                "  Fix: Set via GPO: Computer Config > Windows Settings > Security Settings > Local Policies > Security Options > 'Network security: LAN Manager authentication level' to 'Send NTLMv2 response only'\n\n" +
+                "• SMB Signing — 'Required' prevents MITM attacks\n" +
+                "  Fix: Set via GPO: 'Microsoft network client: Digitally sign communications (always)'. Ensure both client and server agree on signing requirements\n\n" +
+                "• SMB Versions — SMBv1 should be disabled (EternalBlue). SMBv2/3 required\n" +
+                "  Fix: Disable SMBv1: 'Set-SmbServerConfiguration -EnableSMB1Protocol $false'. Or via Windows Features: 'Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol'\n\n" +
+                "• Guest Fallback — AllowInsecureGuestAuth registry setting. When disabled (default on Win10 1709+), anonymous/guest access silently fails with 'access denied'\n" +
+                "  Fix: If you need guest access (not recommended), set HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanWorkstation\\Parameters\\AllowInsecureGuestAuth to 1. Better fix: configure proper authentication on the share\n\n" +
+                "• Share Access Test — attempts 'net use' to the configured UNC path and disconnects\n" +
+                "  Fix: If all other tests pass but share access fails, check share-level AND NTFS permissions. Run 'net use \\\\<server>\\<share>' manually to see the exact error message"));
 
             s.Add(("Credential Store",
-                "Checks stored credentials and NTLM hash availability:\n" +
-                "• Credential Manager — queries 'cmdkey /list' for explicitly saved credentials (via 'Remember my credentials' or net use /savecred). Absence is normal — Kerberos SSO doesn't require saved credentials\n" +
-                "• NTLM Hash Available — definitively tests whether the password hash is cached in LSASS by generating an NTLM token via SSPI:\n" +
-                "  - Token generated → hash IS cached (PASS for AD, automatic after password logon)\n" +
-                "  - No token → hash NOT cached, likely WHfB/PIN-only logon (FAIL for AD)\n\n" +
-                "This is more reliable than registry checks, as it tests the actual SSPI authentication path."));
+                "Checks stored credentials and NTLM hash availability:\n\n" +
+                "• Credential Manager — queries 'cmdkey /list' for saved credentials. Absence is normal — Kerberos SSO doesn't require saved credentials\n" +
+                "  Fix: To add a credential manually: 'cmdkey /add:<server> /user:<domain\\user> /pass'. To clear a stale one: 'cmdkey /delete:<target>'. Stale credentials can override Kerberos SSO\n\n" +
+                "• NTLM Hash Available — tests whether the password hash is cached in LSASS via SSPI\n" +
+                "  - Token generated → hash IS cached (PASS, automatic after password logon)\n" +
+                "  - No token → hash NOT cached, likely WHfB/PIN-only logon (FAIL)\n\n" +
+                "  Fix: If hash is missing and NTLM fallback is needed, sign out and sign in with password (not PIN/WHfB). To fix permanently, enable the 'Allow NTLM hash' WHfB policy so the hash is cached alongside WHfB credentials"));
         }
 
         return s;
@@ -655,7 +878,11 @@ class MainForm : Form
             return;
         }
 
-        var scenario = _cboScenario.SelectedIndex == 1 ? Scenario.Entra : Scenario.AD;
+        var scenario = _scenarioIndex == 1 ? Scenario.Entra : Scenario.AD;
+
+        _runCts?.Cancel();
+        _runCts = new CancellationTokenSource();
+        var cts = _runCts;
 
         _btnRun.Enabled = false;
         _btnExport.Enabled = false;
@@ -663,34 +890,123 @@ class MainForm : Form
         _lblStatus.Text = "Running diagnostics...";
         SwitchTab(true);
 
-        RenderResults(BuildSkeleton(), running: true);
+        bool isEntra = scenario == Scenario.Entra;
+        var results = BuildSkeleton(isEntra);
+        RenderResults(results, running: true);
 
-        var config = new DiagConfig(server, domain, dc, share, scenario);
-        var results = await Task.Run(() => RunAllTests(config));
+        var history = _runHistory[_scenarioIndex];
+        history.Insert(0, new DiagRun(DateTime.MinValue, server, results));
+        _selectedRunIndex = 0;
+        RebuildHistoryBar();
+
+        bool purge = _chkPurge.Checked;
+        var config = new DiagConfig(server, domain, dc, share, scenario, purge);
+        int completed = 0;
+        int totalGroups = results.Count;
+
+        void ReplaceGroup(string name, TestGroup result)
+        {
+            if (cts.IsCancellationRequested || IsDisposed) return;
+            int idx = results.FindIndex(g => g.Name == name);
+            if (idx >= 0) results[idx] = result;
+            completed++;
+            _lblStatus.Text = $"Running diagnostics... ({completed}/{totalGroups})";
+            ShowResults(results);
+        }
+
+        var identityTask = Task.Run(() => TestDeviceIdentity(config));
+        var kerbTask = Task.Run(() => TestKerberosTickets(config));
+        var sspiTask = Task.Run(() => TestSspiNegotiation(config));
+        var netTask = Task.Run(() => TestNetworkPath(config));
+        var smbTask = Task.Run(() => TestSmbConfig(config));
+        var shareTask = Task.Run(() => TestShareAccess(config));
+        var credTask = Task.Run(() => TestCredentialStore(config));
+
+        var pending = new List<(Task task, string name, Func<TestGroup> getResult)>
+        {
+            (identityTask, "Identity & Device", () => identityTask.Result),
+            (kerbTask, "Kerberos Tickets", () => kerbTask.Result),
+            (sspiTask, "SSPI / SPNEGO Negotiation", () => sspiTask.Result),
+            (netTask, "Network Path", () => netTask.Result),
+            (smbTask, "SMB Configuration", () => smbTask.Result),
+            (shareTask, "Share Access", () => shareTask.Result),
+            (credTask, "Credential Store", () => credTask.Result),
+        };
+
+        while (pending.Count > 0)
+        {
+            var done = await Task.WhenAny(pending.Select(p => p.task));
+            if (cts.IsCancellationRequested || IsDisposed) return;
+            var match = pending.First(p => p.task == done);
+            pending.Remove(match);
+            ReplaceGroup(match.name, match.getResult());
+        }
+
+        if (!isEntra)
+        {
+            var kerbGroup = results.First(g => g.Name == "Kerberos Tickets");
+            bool hasCifsTicket = kerbGroup.Tests.Any(t =>
+                t.Name == "cifs/ Service Ticket" && t.Status == Status.Pass);
+            var kerbConfig = await Task.Run(() => TestKerberosConfig(config, hasCifsTicket));
+            if (cts.IsCancellationRequested || IsDisposed) return;
+            ReplaceGroup("Kerberos Configuration", kerbConfig);
+        }
+
+        if (purge)
+        {
+            _chkPurge.Checked = false;
+            _lblStatus.Text = "Reacquiring tickets...";
+            await Task.Delay(500);
+            if (cts.IsCancellationRequested || IsDisposed) return;
+            var refetchConfig = config with { PurgeTickets = false };
+            var freshKerb = await Task.Run(() => TestKerberosTickets(refetchConfig));
+            if (cts.IsCancellationRequested || IsDisposed) return;
+            int kerbIdx = results.FindIndex(g => g.Name == "Kerberos Tickets");
+            if (kerbIdx >= 0)
+            {
+                var purgeEntry = results[kerbIdx].Tests.FirstOrDefault(t => t.Name == "Ticket Purge");
+                var freshTests = new List<TestEntry>();
+                if (purgeEntry != null) freshTests.Add(purgeEntry);
+                freshTests.AddRange(freshKerb.Tests.Where(t => t.Name != "Ticket Purge"));
+                results[kerbIdx] = new TestGroup("Kerberos Tickets", freshTests);
+                ShowResults(results);
+            }
+        }
 
         _lastResults = results;
-        _resultsByScenario[_cboScenario.SelectedIndex] = results;
+        history[0] = new DiagRun(DateTime.Now, server, results);
+        if (history.Count > 5) history.RemoveAt(5);
+        _selectedRunIndex = 0;
         ShowResults(results);
+        RebuildHistoryBar();
 
         SaveSettings();
         _lblStatus.Text = "Complete";
         _btnRun.Enabled = true;
         _btnExport.Enabled = true;
+        _btnOpenShare.Enabled = true;
     }
 
-    void CboScenario_Changed(object? sender, EventArgs e)
+    void SetScenario(int index)
     {
+        if (_scenarioIndex == index) return;
+        _scenarioIndex = index;
+        StyleScenarioButtons();
         PopulateGuide();
 
-        if (_resultsByScenario.TryGetValue(_cboScenario.SelectedIndex, out var cached))
+        var history = _runHistory[_scenarioIndex];
+        if (history.Count > 0)
         {
-            _lastResults = cached;
-            ShowResults(cached);
+            _selectedRunIndex = 0;
+            _lastResults = history[0].Results;
+            ShowResults(history[0].Results);
             _lblStatus.Text = "Complete";
             _btnExport.Enabled = true;
+            _btnOpenShare.Enabled = true;
         }
         else
         {
+            _selectedRunIndex = -1;
             _lastResults = null;
             _renderedGroups = null;
             _placeholderText = "Run diagnostics for this scenario";
@@ -700,6 +1016,112 @@ class MainForm : Form
             _lblStatus.Text = "";
             _btnExport.Enabled = false;
         }
+        RebuildHistoryBar();
+    }
+
+    void StyleScenarioButtons()
+    {
+        bool adActive = _scenarioIndex == 0;
+        _btnAD.BackColor = adActive ? AccentColor : SurfaceColor;
+        _btnAD.ForeColor = adActive ? Color.Black : DimColor;
+        _btnEntra.BackColor = adActive ? SurfaceColor : AccentColor;
+        _btnEntra.ForeColor = adActive ? DimColor : Color.Black;
+    }
+
+    void RebuildHistoryBar()
+    {
+        _historyPanel.Controls.Clear();
+        var history = _runHistory[_scenarioIndex];
+        if (history.Count == 0)
+        {
+            _historyPanel.Visible = false;
+            return;
+        }
+
+        int x = 10;
+        var lblRuns = new Label { Text = "Runs:", ForeColor = DimColor, Font = new Font("Segoe UI", 8f), AutoSize = true, Location = new Point(x, 6) };
+        _historyPanel.Controls.Add(lblRuns);
+        x += lblRuns.PreferredWidth + 4;
+
+        for (int ri = history.Count - 1; ri >= 0; ri--)
+        {
+            int idx = ri;
+            var run = history[ri];
+            bool selected = ri == _selectedRunIndex;
+            bool isPending = run.Timestamp == DateTime.MinValue;
+            string label = isPending ? "Pending..." : run.Timestamp.ToString("HH:mm:ss");
+
+            var btn = new Button
+            {
+                Text = label, FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 7.5f, selected ? FontStyle.Bold : FontStyle.Regular),
+                BackColor = selected ? (isPending ? WarnColor : AccentColor) : SurfaceColor,
+                ForeColor = selected ? Color.Black : (isPending ? WarnColor : DimColor),
+                Size = new Size(isPending ? 72 : 62, 20), Location = new Point(x, 4), Cursor = Cursors.Hand,
+            };
+            btn.FlatAppearance.BorderSize = 0;
+            if (!isPending) btn.Click += (s, e) => SelectRun(idx);
+            _historyPanel.Controls.Add(btn);
+            x += (isPending ? 76 : 66);
+        }
+
+        var del = new Button
+        {
+            Text = "Delete Run", FlatStyle = FlatStyle.Flat,
+            Font = new Font("Segoe UI", 7.5f),
+            BackColor = SurfaceColor, ForeColor = FailColor,
+            Size = new Size(70, 20), Cursor = Cursors.Hand,
+            Anchor = AnchorStyles.Top | AnchorStyles.Right,
+        };
+        del.FlatAppearance.BorderSize = 0;
+        del.Location = new Point(_historyPanel.ClientSize.Width - del.Width - 10, 4);
+        del.Click += (s, e) => DeleteRun(_selectedRunIndex);
+        _historyPanel.Controls.Add(del);
+
+        _historyPanel.Visible = true;
+    }
+
+    void SelectRun(int index)
+    {
+        var history = _runHistory[_scenarioIndex];
+        if (index < 0 || index >= history.Count) return;
+        _selectedRunIndex = index;
+        _lastResults = history[index].Results;
+        ShowResults(history[index].Results);
+        _lblStatus.Text = $"Run from {history[index].Timestamp:HH:mm:ss}";
+        _btnExport.Enabled = true;
+        _btnOpenShare.Enabled = true;
+        RebuildHistoryBar();
+    }
+
+    void DeleteRun(int index)
+    {
+        var history = _runHistory[_scenarioIndex];
+        if (index < 0 || index >= history.Count) return;
+        history.RemoveAt(index);
+
+        if (history.Count == 0)
+        {
+            _selectedRunIndex = -1;
+            _lastResults = null;
+            _renderedGroups = null;
+            _placeholderText = "Run diagnostics for this scenario";
+            _resultsCanvas.Height = 200;
+            _resultsCanvas.Invalidate();
+            _summaryPanel.Visible = false;
+            _lblStatus.Text = "";
+            _btnExport.Enabled = false;
+            _btnOpenShare.Enabled = false;
+        }
+        else
+        {
+            if (_selectedRunIndex >= history.Count)
+                _selectedRunIndex = history.Count - 1;
+            _lastResults = history[_selectedRunIndex].Results;
+            ShowResults(history[_selectedRunIndex].Results);
+            _lblStatus.Text = $"Run from {history[_selectedRunIndex].Timestamp:HH:mm:ss}";
+        }
+        RebuildHistoryBar();
     }
 
     void ShowResults(List<TestGroup> results)
@@ -733,7 +1155,7 @@ class MainForm : Form
         sb.AppendLine("===================================================");
         sb.AppendLine();
         sb.AppendLine("Configuration:");
-        sb.AppendLine($"  Scenario:     {_cboScenario.SelectedItem}");
+        sb.AppendLine($"  Scenario:     {(_scenarioIndex == 1 ? "Entra Joined" : "AD Joined")}");
         sb.AppendLine($"  File Server:  {_txtServer.Text.Trim()}");
         sb.AppendLine($"  Domain:       {_txtDomain.Text.Trim()}");
         sb.AppendLine($"  DC Host:      {_txtDc.Text.Trim()}");
@@ -759,61 +1181,72 @@ class MainForm : Form
 
     // ── Test skeleton ───────────────────────────────────────
 
-    static List<TestGroup> BuildSkeleton() =>
-    [
-        new("Identity & Device", [
-            new("Domain Join Type"), new("Azure AD Join"),
-            new("Cloud Kerberos Trust"), new("OnPremTgt"), new("Logged-on User"),
-            new("WHfB Status"), new("PRT Status")
-        ]),
-        new("Kerberos Tickets", [
-            new("TGT Present"), new("TGT Expiry"),
-            new("cifs/ Service Ticket"), new("Ticket Encryption")
-        ]),
-        new("Kerberos Configuration", [
-            new("SPN Registration"), new("Allowed Enc Types"),
-            new("Max Token Size"), new("DNS SRV Records")
-        ]),
-        new("SSPI / SPNEGO Negotiation", [
-            new("AcquireCredentials"), new("SPNEGO Rounds"),
-            new("Final Auth Package"), new("Negotiation Result")
-        ]),
-        new("Network Path", [
-            new("DNS Resolution"), new("Port 445 (SMB)"),
-            new("Port 88 (Kerberos)"), new("Port 389 (LDAP)"),
-            new("Port 464 (kpasswd)"), new("Clock Skew")
-        ]),
-        new("SMB Configuration", [
-            new("LmCompatibility Level"), new("SMB Signing"),
-            new("SMB Versions"), new("Share Access Test")
-        ]),
-        new("Credential Store", [
-            new("Credential Manager"), new("NTLM Hash Available")
-        ]),
-    ];
-
-    // ── Diagnostics engine ──────────────────────────────────
-
-    static List<TestGroup> RunAllTests(DiagConfig cfg)
+    static List<TestGroup> BuildSkeleton(bool isEntra)
     {
         var groups = new List<TestGroup>();
-        bool isEntra = cfg.Scenario == Scenario.Entra;
 
-        groups.Add(TestDeviceIdentity(cfg));
-        var kerbGroup = TestKerberosTickets(cfg);
-        groups.Add(kerbGroup);
+        var identity = new List<TestEntry>
+        {
+            new("Domain Join Type"), new("Azure AD Join"),
+        };
+        if (isEntra)
+        {
+            identity.AddRange([new("Cloud Kerberos Trust"), new("OnPremTgt")]);
+        }
+        identity.Add(new("Logged-on User"));
+        identity.AddRange([new("WHfB Status"), new("TPM Status"), new("WHfB Config")]);
+        if (isEntra)
+        {
+            identity.AddRange([new("PRT Status"), new("Cloud AP Plugin"), new("MDM Enrollment")]);
+        }
+        groups.Add(new("Identity & Device", identity));
+
+        groups.Add(new("Kerberos Tickets", [
+            new("Ticket Purge"), new("TGT Present"), new("TGT Expiry"),
+            new("cifs/ Service Ticket"), new("Ticket Encryption")
+        ]));
+
         if (!isEntra)
         {
-            bool hasCifsTicket = kerbGroup.Tests.Any(t =>
-                t.Name == "cifs/ Service Ticket" && t.Status == Status.Pass);
-            groups.Add(TestKerberosConfig(cfg, hasCifsTicket));
+            groups.Add(new("Kerberos Configuration", [
+                new("SPN Registration"), new("Allowed Enc Types"),
+                new("Max Token Size"), new("DNS SRV Records")
+            ]));
         }
-        groups.Add(TestSspiNegotiation(cfg));
-        groups.Add(TestNetworkPath(cfg));
-        groups.Add(TestSmbConfig(cfg));
-        groups.Add(TestCredentialStore(cfg));
+
+        groups.Add(new("SSPI / SPNEGO Negotiation", [
+            new("AcquireCredentials"), new("SPNEGO Rounds"),
+            new("Final Auth Package"), new("Negotiation Result")
+        ]));
+
+        var network = new List<TestEntry>
+        {
+            new("DNS Resolution"), new("Port 445 (SMB)"),
+            new("Port 88 (Kerberos)"), new("Port 389 (LDAP)"),
+        };
+        if (!isEntra)
+            network.Add(new("Port 464 (kpasswd)"));
+        network.AddRange([new("Clock Skew"), new("DNS Servers"), new("DNS Suffix"), new("IPv6 Status")]);
+        groups.Add(new("Network Path", network));
+
+        var smb = new List<TestEntry>();
+        if (!isEntra)
+            smb.Add(new("LmCompatibility Level"));
+        smb.AddRange([new("SMB Signing"), new("SMB Versions"), new("Guest Fallback")]);
+        groups.Add(new("SMB Configuration", smb));
+
+        groups.Add(new("Share Access", [new("Share Access Test")]));
+
+        var creds = new List<TestEntry>();
+        if (!isEntra)
+            creds.Add(new("Credential Manager"));
+        creds.Add(new("NTLM Hash Available"));
+        groups.Add(new("Credential Store", creds));
+
         return groups;
     }
+
+    // ── Diagnostics engine ──────────────────────────────────
 
     static TestGroup TestDeviceIdentity(DiagConfig cfg)
     {
@@ -827,22 +1260,17 @@ class MainForm : Form
 
             var m = Regex.Match(dsreg, @"DomainJoined\s*:\s*(\S+)");
             bool domJoined = m.Success && m.Groups[1].Value == "YES";
-            if (isEntra)
-                tests.Add(new("Domain Join Type",
-                    domJoined ? Status.Pass : Status.Skip,
-                    m.Success ? $"DomainJoined: {m.Groups[1].Value}" : "N/A (Entra-only)"));
-            else
-                tests.Add(new("Domain Join Type",
-                    domJoined ? Status.Pass : Status.Fail,
-                    m.Success ? $"DomainJoined: {m.Groups[1].Value}" : "Could not determine"));
+
+            var aadMatch = Regex.Match(dsreg, @"AzureAdJoined\s*:\s*(\S+)");
+            bool aadJoined = aadMatch.Success && aadMatch.Groups[1].Value == "YES";
 
             if (isEntra)
             {
-                m = Regex.Match(dsreg, @"AzureAdJoined\s*:\s*(\S+)");
-                bool aadJoined = m.Success && m.Groups[1].Value == "YES";
+                tests.Add(new("Domain Join Type", Status.Pass,
+                    m.Success ? $"DomainJoined: {m.Groups[1].Value}" + (domJoined ? " (hybrid)" : "") : "Not available"));
                 tests.Add(new("Azure AD Join",
                     aadJoined ? Status.Pass : Status.Fail,
-                    m.Success ? $"AzureAdJoined: {m.Groups[1].Value}" : "NOT JOINED - required for Entra"));
+                    aadMatch.Success ? $"AzureAdJoined: {aadMatch.Groups[1].Value}" : "NOT JOINED - required for Entra"));
 
                 m = Regex.Match(dsreg, @"CloudTgt\s*:\s*(\S+)");
                 bool cloudTgt = m.Success && m.Groups[1].Value == "YES";
@@ -857,10 +1285,24 @@ class MainForm : Form
                     m.Success ? $"OnPremTgt: {m.Groups[1].Value}"
                         : "Not present - CKT may not be issuing on-prem TGTs"));
             }
+            else
+            {
+                tests.Add(new("Domain Join Type",
+                    domJoined ? Status.Pass : Status.Fail,
+                    m.Success ? $"DomainJoined: {m.Groups[1].Value}" : "Could not determine"));
+                tests.Add(new("Azure AD Join", Status.Pass,
+                    aadMatch.Success ? $"AzureAdJoined: {aadMatch.Groups[1].Value}" + (aadJoined ? " (hybrid)" : "") : "Not available"));
+            }
         }
         catch (Exception ex)
         {
             tests.Add(new("Domain Join Type", Status.Fail, $"dsregcmd error: {ex.Message}"));
+            tests.Add(new("Azure AD Join", Status.Fail, $"dsregcmd error: {ex.Message}"));
+            if (isEntra)
+            {
+                tests.Add(new("Cloud Kerberos Trust", Status.Fail, "dsregcmd unavailable"));
+                tests.Add(new("OnPremTgt", Status.Fail, "dsregcmd unavailable"));
+            }
         }
 
         try
@@ -894,6 +1336,83 @@ class MainForm : Form
                 tests.Add(new("WHfB Status", Status.Pass, "WHfB provider disabled - password auth"));
             else
                 tests.Add(new("WHfB Status", Status.Pass, "No NGC enrollment detected"));
+
+            tests.Add(DetectTpm());
+
+            if (ngcSet)
+            {
+                var details = new List<string>();
+
+                string? useCloudTrust = ReadRegistryString(
+                    @"HKLM\SOFTWARE\Policies\Microsoft\PassportForWork", "UseCloudTrustForOnPremAuth");
+                string? useCert = ReadRegistryString(
+                    @"HKLM\SOFTWARE\Policies\Microsoft\PassportForWork", "UseCertificateForOnPremAuth");
+                string trustModel = useCloudTrust == "1" ? "Cloud Kerberos Trust"
+                    : useCert == "1" ? "Certificate Trust"
+                    : "Key Trust (default)";
+                details.Add($"Trust: {trustModel}");
+
+                string? requireDevice = ReadRegistryString(
+                    @"HKLM\SOFTWARE\Policies\Microsoft\PassportForWork", "RequireSecurityDevice");
+                if (requireDevice == "1") details.Add("TPM required by policy");
+
+                bool hasFace = false, hasFingerprint = false, hasPin = false;
+                try
+                {
+                    using var bioKey = Registry.LocalMachine.OpenSubKey(
+                        @"SOFTWARE\Microsoft\Windows\CurrentVersion\WinBio\EnrolledFactors");
+                    if (bioKey != null)
+                    {
+                        string? factors = bioKey.GetValue("EnrolledFactors")?.ToString();
+                        if (factors != null && int.TryParse(factors, out int f))
+                        {
+                            hasFingerprint = (f & 0x08) != 0;
+                            hasFace = (f & 0x10) != 0;
+                        }
+                    }
+                }
+                catch { }
+
+                var ngcPreMatch = Regex.Match(dsreg ?? "", @"NgcPrerequisiteCheck[^§]*?(?=\+---|\z)", RegexOptions.Singleline);
+                if (!hasFace && !hasFingerprint)
+                {
+                    try
+                    {
+                        using var bioEnum = Registry.LocalMachine.OpenSubKey(
+                            @"SYSTEM\CurrentControlSet\Enum\ROOT\WindowsBiometricProxyDevice");
+                        if (bioEnum != null) hasFace = true;
+                    }
+                    catch { }
+                    try
+                    {
+                        using var fpEnum = Registry.LocalMachine.OpenSubKey(
+                            @"SYSTEM\CurrentControlSet\Services\WbioSrvc");
+                        string? wbioStart = fpEnum?.GetValue("Start")?.ToString();
+                        if (wbioStart == "2" || wbioStart == "3")
+                        {
+                            using var sensorKey = Registry.LocalMachine.OpenSubKey(
+                                @"SOFTWARE\Microsoft\Windows\CurrentVersion\WinBio\Databases");
+                            if (sensorKey?.GetSubKeyNames().Length > 0) hasFingerprint = true;
+                        }
+                    }
+                    catch { }
+                }
+
+                hasPin = ngcSet;
+                var creds = new List<string>();
+                if (hasPin) creds.Add("PIN");
+                if (hasFingerprint) creds.Add("Fingerprint");
+                if (hasFace) creds.Add("Face");
+                details.Add($"Credentials: {string.Join(", ", creds)}");
+
+                tests.Add(new("WHfB Config",
+                    Status.Pass,
+                    string.Join(" | ", details)));
+            }
+            else
+            {
+                tests.Add(new("WHfB Config", Status.Skip, "WHfB not enrolled"));
+            }
         }
         catch
         {
@@ -918,6 +1437,49 @@ class MainForm : Form
             }
         }
 
+        if (isEntra)
+        {
+            // Cloud AP plugin
+            try
+            {
+                var capMatch = Regex.Match(dsreg ?? "", @"CloudExperienceHostBroker\s*:\s*(\S+)", RegexOptions.IgnoreCase);
+                var ssoMatch = Regex.Match(dsreg ?? "", @"SSO\s*State[^:]*:\s*(.+)", RegexOptions.IgnoreCase);
+                bool hasCap = (dsreg ?? "").Contains("AzureAdPrt", StringComparison.OrdinalIgnoreCase);
+                if (hasCap)
+                    tests.Add(new("Cloud AP Plugin", Status.Pass,
+                        "Azure AD CloudAP plugin active (PRT section present in dsregcmd)"));
+                else
+                    tests.Add(new("Cloud AP Plugin", Status.Warn,
+                        "CloudAP plugin may not be loaded - no PRT data in dsregcmd output"));
+            }
+            catch
+            {
+                tests.Add(new("Cloud AP Plugin", Status.Skip, "Cannot determine"));
+            }
+
+            // MDM/Intune enrollment
+            try
+            {
+                var mdmMatch = Regex.Match(dsreg ?? "", @"MdmUrl\s*:\s*(\S+)", RegexOptions.IgnoreCase);
+                bool managedByMdm = Regex.IsMatch(dsreg ?? "", @"Managed by MDM", RegexOptions.IgnoreCase);
+                if (mdmMatch.Success && !string.IsNullOrWhiteSpace(mdmMatch.Groups[1].Value))
+                {
+                    bool isIntune = mdmMatch.Groups[1].Value.Contains("manage.microsoft.com", StringComparison.OrdinalIgnoreCase);
+                    string provider = isIntune ? "Intune" : "MDM";
+                    tests.Add(new("MDM Enrollment",
+                        managedByMdm ? Status.Pass : Status.Warn,
+                        managedByMdm ? $"{provider} enrolled, actively managed"
+                                     : $"{provider} enrolled, management status unknown"));
+                }
+                else
+                    tests.Add(new("MDM Enrollment", Status.Skip,
+                        "No MDM enrollment detected"));
+            }
+            catch
+            {
+                tests.Add(new("MDM Enrollment", Status.Skip, "Cannot determine"));
+            }
+        }
         return new("Identity & Device", tests);
     }
 
@@ -925,6 +1487,19 @@ class MainForm : Form
     {
         var tests = new List<TestEntry>();
         string realm = cfg.Domain.ToUpperInvariant();
+
+        if (cfg.PurgeTickets)
+        {
+            try
+            {
+                RunProcess("klist", "purge");
+                tests.Add(new("Ticket Purge", Status.Pass, "Purged all cached tickets — reacquiring"));
+            }
+            catch (Exception ex)
+            {
+                tests.Add(new("Ticket Purge", Status.Warn, $"Purge failed: {ex.Message}"));
+            }
+        }
 
         try
         {
@@ -991,6 +1566,9 @@ class MainForm : Form
         catch (Exception ex)
         {
             tests.Add(new("TGT Present", Status.Fail, $"klist error: {ex.Message}"));
+            tests.Add(new("TGT Expiry", Status.Skip, "klist unavailable"));
+            tests.Add(new("cifs/ Service Ticket", Status.Skip, "klist unavailable"));
+            tests.Add(new("Ticket Encryption", Status.Skip, "klist unavailable"));
         }
 
         return new("Kerberos Tickets", tests);
@@ -1079,8 +1657,12 @@ class MainForm : Form
             }
             finally
             {
+                if (outBufPtr != IntPtr.Zero)
+                {
+                    unsafe { new Span<byte>((void*)outBufPtr, maxTokenSize).Clear(); }
+                    Marshal.FreeHGlobal(outBufPtr);
+                }
                 if (secBufPtr != IntPtr.Zero) Marshal.FreeHGlobal(secBufPtr);
-                if (outBufPtr != IntPtr.Zero) Marshal.FreeHGlobal(outBufPtr);
                 if (outDescPtr != IntPtr.Zero) Marshal.FreeHGlobal(outDescPtr);
                 if (!ctx.IsZero) Secur32.DeleteSecurityContext(ref ctx);
                 Secur32.FreeCredentialsHandle(ref cred);
@@ -1103,40 +1685,58 @@ class MainForm : Form
         string kdc = !string.IsNullOrEmpty(cfg.Dc) ? cfg.Dc : cfg.Domain;
         bool isEntra = cfg.Scenario == Scenario.Entra;
 
+        IPAddress? serverIp = null;
+        IPAddress[]? serverAddrs = null;
         try
         {
-            var addrs = Dns.GetHostAddresses(cfg.Server);
-            var ips = string.Join(", ", addrs.Where(a => a.AddressFamily == AddressFamily.InterNetwork));
+            serverAddrs = Dns.GetHostAddresses(cfg.Server);
+            var ipv4 = serverAddrs.Where(a => a.AddressFamily == AddressFamily.InterNetwork).ToArray();
+            serverIp = ipv4.FirstOrDefault() ?? serverAddrs.FirstOrDefault();
+            var ips = string.Join(", ", ipv4.Select(a => a.ToString()));
             tests.Add(new("DNS Resolution",
                 !string.IsNullOrEmpty(ips) ? Status.Pass : Status.Warn,
-                !string.IsNullOrEmpty(ips) ? $"{cfg.Server} -> {ips}" : "Resolved but no A records"));
+                !string.IsNullOrEmpty(ips) ? $"{cfg.Server} → {ips}" : "Resolved but no A records"));
         }
         catch { tests.Add(new("DNS Resolution", Status.Fail, $"Cannot resolve {cfg.Server}")); }
 
-        bool p445 = TryTcpConnect(cfg.Server, 445);
-        tests.Add(new("Port 445 (SMB)", p445 ? Status.Pass : Status.Fail,
-            p445 ? $"Open on {cfg.Server}" : "Closed or filtered"));
-
-        bool p88 = TryTcpConnect(kdc, 88);
-        tests.Add(new("Port 88 (Kerberos)",
-            p88 ? Status.Pass : (isEntra ? Status.Warn : Status.Fail),
-            p88 ? $"KDC reachable at {kdc}"
-               : $"KDC unreachable at {kdc}" + (isEntra ? " (uses cloud KDC)" : " - no Kerberos possible")));
-
-        bool p389 = TryTcpConnect(kdc, 389);
-        tests.Add(new("Port 389 (LDAP)", p389 ? Status.Pass : Status.Warn,
-            p389 ? $"LDAP reachable at {kdc}" : "LDAP unreachable"));
-
-        if (!isEntra)
+        IPAddress? kdcIp = null;
+        if (kdc != cfg.Server)
         {
-            bool p464 = TryTcpConnect(kdc, 464);
-            tests.Add(new("Port 464 (kpasswd)", p464 ? Status.Pass : Status.Warn,
-                p464 ? $"kpasswd reachable at {kdc}" : "kpasswd unreachable"));
+            try { kdcIp = Dns.GetHostAddresses(kdc).FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork); }
+            catch { }
+        }
+        else
+            kdcIp = serverIp;
+
+        var portTasks = new List<(string Name, int Port, string Host, Task<bool> Task)>();
+        portTasks.Add(("Port 445 (SMB)", 445, cfg.Server, Task.Run(() => TryTcpConnect(serverIp, cfg.Server, 445))));
+        portTasks.Add(("Port 88 (Kerberos)", 88, kdc, Task.Run(() => TryTcpConnect(kdcIp, kdc, 88))));
+        portTasks.Add(("Port 389 (LDAP)", 389, kdc, Task.Run(() => TryTcpConnect(kdcIp, kdc, 389))));
+        if (!isEntra)
+            portTasks.Add(("Port 464 (kpasswd)", 464, kdc, Task.Run(() => TryTcpConnect(kdcIp, kdc, 464))));
+
+        Task.WaitAll(portTasks.Select(p => p.Task).ToArray());
+
+        foreach (var (name, port, host, task) in portTasks)
+        {
+            bool open = task.Result;
+            if (port == 445)
+                tests.Add(new(name, open ? Status.Pass : Status.Fail,
+                    open ? $"Open on {host}" : "Closed or filtered"));
+            else if (port == 88)
+                tests.Add(new(name,
+                    open ? Status.Pass : (isEntra ? Status.Warn : Status.Fail),
+                    open ? $"KDC reachable at {host}"
+                       : $"KDC unreachable at {host}" + (isEntra ? " (uses cloud KDC)" : " - no Kerberos possible")));
+            else
+                tests.Add(new(name, open ? Status.Pass : Status.Warn,
+                    open ? $"{name.Split('(')[1].TrimEnd(')')} reachable at {host}"
+                       : $"{name.Split('(')[1].TrimEnd(')')} unreachable"));
         }
 
         try
         {
-            string w32 = RunProcess("w32tm", $"/stripchart /computer:{kdc} /samples:1 /dataonly");
+            string w32 = RunProcess("w32tm", $"/stripchart /computer:{kdc} /samples:1 /dataonly", timeoutMs: 5000);
             var m = Regex.Match(w32, @"([+-]?\d+\.\d+)s");
             if (m.Success)
             {
@@ -1149,6 +1749,69 @@ class MainForm : Form
                 tests.Add(new("Clock Skew", Status.Warn, "Cannot measure (DC unreachable?)"));
         }
         catch { tests.Add(new("Clock Skew", Status.Warn, "w32tm not available")); }
+
+        // DNS server configuration + suffix (single ipconfig call)
+        string? ipconfigOutput = null;
+        try { ipconfigOutput = RunProcess("ipconfig", "/all"); } catch { }
+
+        if (ipconfigOutput != null)
+        {
+            var dnsServers = Regex.Matches(ipconfigOutput, @"DNS Servers[\s.]*:\s*(.+)", RegexOptions.IgnoreCase);
+            var servers = new List<string>();
+            foreach (Match dm in dnsServers)
+                servers.Add(dm.Groups[1].Value.Trim());
+            if (servers.Count > 0)
+                tests.Add(new("DNS Servers",
+                    Status.Pass, string.Join(", ", servers)));
+            else
+                tests.Add(new("DNS Servers", Status.Warn, "No DNS servers found in ipconfig"));
+        }
+        else
+        {
+            tests.Add(new("DNS Servers", Status.Skip, "Cannot query ipconfig"));
+        }
+
+        try
+        {
+            string ipconfig = ipconfigOutput ?? RunProcess("ipconfig", "/all");
+            var suffixMatch = Regex.Match(ipconfig, @"DNS Suffix Search List[\s.]*:\s*(.+)", RegexOptions.IgnoreCase);
+            var connSuffix = Regex.Match(ipconfig, @"Connection-specific DNS Suffix[\s.]*:\s*(\S+)", RegexOptions.IgnoreCase);
+            var primarySuffix = Regex.Match(ipconfig, @"Primary Dns Suffix[\s.]*:\s*(\S+)", RegexOptions.IgnoreCase);
+
+            var suffixes = new List<string>();
+            if (suffixMatch.Success) suffixes.Add(suffixMatch.Groups[1].Value.Trim());
+            if (primarySuffix.Success) suffixes.Add(primarySuffix.Groups[1].Value.Trim());
+            if (connSuffix.Success && connSuffix.Groups[1].Value.Trim() != "")
+                suffixes.Add(connSuffix.Groups[1].Value.Trim());
+
+            bool hasDomain = suffixes.Any(s => s.Contains(cfg.Domain, StringComparison.OrdinalIgnoreCase));
+            if (suffixes.Count > 0)
+                tests.Add(new("DNS Suffix",
+                    hasDomain ? Status.Pass : Status.Warn,
+                    string.Join(", ", suffixes.Distinct(StringComparer.OrdinalIgnoreCase)) +
+                    (!hasDomain ? $" - domain '{cfg.Domain}' not in suffix list, short names may fail" : "")));
+            else
+                tests.Add(new("DNS Suffix", Status.Warn, "No DNS suffix configured - short name resolution may fail"));
+        }
+        catch { tests.Add(new("DNS Suffix", Status.Skip, "Cannot determine")); }
+
+        if (serverAddrs != null)
+        {
+            bool hasV4 = serverAddrs.Any(a => a.AddressFamily == AddressFamily.InterNetwork);
+            bool hasV6 = serverAddrs.Any(a => a.AddressFamily == AddressFamily.InterNetworkV6);
+            if (hasV6 && !hasV4)
+                tests.Add(new("IPv6 Status", Status.Warn,
+                    $"{cfg.Server} resolves to IPv6 only - SMB may fail if IPv6 routing is incomplete"));
+            else if (hasV6 && hasV4)
+                tests.Add(new("IPv6 Status", Status.Pass,
+                    "Dual-stack (IPv4 + IPv6)"));
+            else
+                tests.Add(new("IPv6 Status", Status.Pass, "IPv4 only"));
+        }
+        else
+        {
+            tests.Add(new("IPv6 Status", Status.Skip, "DNS resolution failed"));
+        }
 
         return new("Network Path", tests);
     }
@@ -1218,7 +1881,7 @@ class MainForm : Form
                     if (isEntra)
                         tests.Add(new("NTLM Hash Available",
                             generated ? Status.Warn : Status.Pass,
-                            generated ? $"NTLM hash present ({resultBuf.cbBuffer}B) - unexpected for Entra-only"
+                            generated ? $"Non-AD NTLM hash cached ({resultBuf.cbBuffer}B) - local/Entra password hash, not domain; likely from password logon or fallback"
                                       : "No NTLM hash (expected for Entra)"));
                     else
                         tests.Add(new("NTLM Hash Available",
@@ -1228,6 +1891,7 @@ class MainForm : Form
                 }
                 finally
                 {
+                    unsafe { new Span<byte>((void*)outBufPtr, bufSize).Clear(); }
                     if (pBuf != IntPtr.Zero) Marshal.FreeHGlobal(pBuf);
                     if (pDesc != IntPtr.Zero) Marshal.FreeHGlobal(pDesc);
                     Marshal.FreeHGlobal(outBufPtr);
@@ -1247,7 +1911,7 @@ class MainForm : Form
 
         try
         {
-            string spnQuery = RunProcess("setspn", $"-Q cifs/{cfg.Server}");
+            string spnQuery = RunProcess("setspn", $"-Q cifs/{cfg.Server}", timeoutMs: 5000);
             bool found = spnQuery.Contains($"cifs/{cfg.Server}", StringComparison.OrdinalIgnoreCase)
                       && !spnQuery.Contains("No such SPN found", StringComparison.OrdinalIgnoreCase);
             if (found)
@@ -1322,7 +1986,7 @@ class MainForm : Form
 
         try
         {
-            string nslookup = RunProcess("nslookup", $"-type=SRV _kerberos._tcp.{cfg.Domain}");
+            string nslookup = RunProcess("nslookup", $"-type=SRV _kerberos._tcp.{cfg.Domain}", timeoutMs: 5000);
             bool hasSrv = nslookup.Contains("service", StringComparison.OrdinalIgnoreCase)
                        && nslookup.Contains(cfg.Domain, StringComparison.OrdinalIgnoreCase);
             if (hasSrv)
@@ -1354,7 +2018,8 @@ class MainForm : Form
                 string? lmLevel = ReadRegistryString(
                     @"HKLM\SYSTEM\CurrentControlSet\Control\Lsa",
                     "LmCompatibilityLevel");
-                int level = lmLevel != null && int.TryParse(lmLevel, out int lm) ? lm : 3;
+                bool isDefault = lmLevel == null;
+                int level = !isDefault && int.TryParse(lmLevel, out int lm) ? lm : 3;
                 string desc = level switch
                 {
                     0 => "Send LM & NTLM",
@@ -1367,7 +2032,7 @@ class MainForm : Form
                 };
                 tests.Add(new("LmCompatibility Level",
                     level >= 3 ? Status.Pass : level >= 1 ? Status.Warn : Status.Fail,
-                    $"Level {level}: {desc}"));
+                    $"Level {level}: {desc}" + (isDefault ? " (OS default)" : "")));
             }
             catch
             {
@@ -1396,13 +2061,25 @@ class MainForm : Form
 
         try
         {
-            string ps = RunProcess("powershell", "-NoProfile -Command \"Get-SmbServerConfiguration | Select-Object -ExpandProperty EnableSMB1Protocol; Get-SmbServerConfiguration | Select-Object -ExpandProperty EnableSMB2Protocol\"");
-            var lines = ps.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            bool smb1 = lines.Length > 0 && lines[0].Equals("True", StringComparison.OrdinalIgnoreCase);
-            bool smb2 = lines.Length > 1 && lines[1].Equals("True", StringComparison.OrdinalIgnoreCase);
+            string? smb1ServerVal = ReadRegistryString(
+                @"HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters",
+                "SMB1");
+            string? mrxStart = ReadRegistryString(
+                @"HKLM\SYSTEM\CurrentControlSet\Services\mrxsmb10",
+                "Start");
+            string? smb2ServerVal = ReadRegistryString(
+                @"HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters",
+                "SMB2");
+
+            bool smb1ServerOff = smb1ServerVal == "0";
+            bool smb1DriverGone = mrxStart == null || mrxStart == "4";
+            bool smb1 = !smb1ServerOff && !smb1DriverGone;
+            bool smb2 = smb2ServerVal != "0";
 
             if (smb2 && !smb1)
-                tests.Add(new("SMB Versions", Status.Pass, "SMBv2/3 enabled, SMBv1 disabled"));
+                tests.Add(new("SMB Versions", Status.Pass,
+                    smb1DriverGone ? "SMBv2/3 enabled, SMBv1 removed"
+                                  : "SMBv2/3 enabled, SMBv1 disabled"));
             else if (smb2 && smb1)
                 tests.Add(new("SMB Versions", Status.Warn, "SMBv1 still enabled (security risk)"));
             else if (!smb2)
@@ -1415,16 +2092,39 @@ class MainForm : Form
             tests.Add(new("SMB Versions", Status.Skip, "Cannot query SMB config"));
         }
 
+        // SMB guest fallback
+        try
+        {
+            string? guestAuth = ReadRegistryString(
+                @"HKLM\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters",
+                "AllowInsecureGuestAuth");
+            bool allowed = guestAuth == "1";
+            tests.Add(new("Guest Fallback",
+                allowed ? Status.Warn : Status.Pass,
+                allowed ? "AllowInsecureGuestAuth=1 - insecure guest access enabled"
+                        : "Guest/anonymous fallback blocked (default, secure)"));
+        }
+        catch
+        {
+            tests.Add(new("Guest Fallback", Status.Skip, "Cannot read registry"));
+        }
+
+        return new("SMB Configuration", tests);
+    }
+
+    static TestGroup TestShareAccess(DiagConfig cfg)
+    {
+        var tests = new List<TestEntry>();
         if (!string.IsNullOrEmpty(cfg.Share))
         {
             try
             {
                 string uncPath = $@"\\{cfg.Server}\{cfg.Share}";
-                string net = RunProcess("net", $"use \"{uncPath}\" /persistent:no", timeoutMs: 10000);
+                string net = RunProcess("net", $"use \"{uncPath}\" /persistent:no", timeoutMs: 8000);
                 bool ok = net.Contains("successfully", StringComparison.OrdinalIgnoreCase);
                 if (ok)
                 {
-                    RunProcess("net", $"use \"{uncPath}\" /delete /yes", timeoutMs: 5000);
+                    RunProcess("net", $"use \"{uncPath}\" /delete /yes", timeoutMs: 3000);
                     tests.Add(new("Share Access Test", Status.Pass, $"Connected to {uncPath}"));
                 }
                 else
@@ -1441,8 +2141,7 @@ class MainForm : Form
         {
             tests.Add(new("Share Access Test", Status.Skip, "No share path configured"));
         }
-
-        return new("SMB Configuration", tests);
+        return new("Share Access", tests);
     }
 
     // ── Helpers ─────────────────────────────────────────────
@@ -1458,20 +2157,122 @@ class MainForm : Form
         };
         using var proc = Process.Start(psi)
             ?? throw new InvalidOperationException($"Failed to start {fileName}");
-        string output = proc.StandardOutput.ReadToEnd();
+        var outputTask = proc.StandardOutput.ReadToEndAsync();
         if (!proc.WaitForExit(timeoutMs))
         {
-            try { proc.Kill(); } catch { }
+            try { proc.Kill(true); } catch { }
         }
-        return output;
+        return outputTask.GetAwaiter().GetResult();
     }
 
-    static bool TryTcpConnect(string host, int port, int timeoutMs = 3000)
+    static TestEntry DetectTpm()
+    {
+        var parts = new List<string>();
+
+        string? specVersion = ReadRegistryString(
+            @"HKLM\SYSTEM\CurrentControlSet\Services\TPM\WMI", "SpecVersion");
+        string tpmSpec = "";
+        if (specVersion != null)
+        {
+            string major = specVersion.Split(',')[0].Trim();
+            tpmSpec = major.StartsWith("2") ? "2.0" : major;
+        }
+
+        // Method 1: tpmtool (works without elevation on Win10+)
+        try
+        {
+            string tpmtool = RunProcess("tpmtool", "getdeviceinformation", timeoutMs: 5000);
+            if (tpmtool.Contains("not found", StringComparison.OrdinalIgnoreCase)
+                || tpmtool.Contains("not supported", StringComparison.OrdinalIgnoreCase))
+            {
+                // tpmtool ran but no TPM — fall through to other methods
+            }
+            else if (tpmtool.Contains("TPM", StringComparison.OrdinalIgnoreCase))
+            {
+                var mfg = Regex.Match(tpmtool, @"Manufacturer\s*(?:Name|Info)[^:]*:\s*(.+)", RegexOptions.IgnoreCase);
+                var ver = Regex.Match(tpmtool, @"Firmware Version\s*:\s*(.+)", RegexOptions.IgnoreCase);
+                var isVirtual = tpmtool.Contains("Virtual", StringComparison.OrdinalIgnoreCase)
+                    || tpmtool.Contains("Hyper-V", StringComparison.OrdinalIgnoreCase)
+                    || tpmtool.Contains("VMware", StringComparison.OrdinalIgnoreCase);
+
+                parts.Add("Present");
+                if (!string.IsNullOrEmpty(tpmSpec)) parts.Add($"TPM {tpmSpec}");
+                if (isVirtual) parts.Add("vTPM");
+                if (mfg.Success) parts.Add(mfg.Groups[1].Value.Trim());
+                if (ver.Success) parts.Add($"FW {ver.Groups[1].Value.Trim()}");
+                return new("TPM Status", Status.Pass, string.Join(" | ", parts));
+            }
+        }
+        catch { }
+
+        // Method 2: Registry detection (no elevation needed)
+        try
+        {
+            using var tpmDevice = Registry.LocalMachine.OpenSubKey(
+                @"SYSTEM\CurrentControlSet\Services\TPM\WMI");
+            if (tpmDevice != null && specVersion != null)
+            {
+                parts.Add("Present (via registry)");
+                parts.Add($"TPM {tpmSpec}");
+                string? mfgId = tpmDevice.GetValue("ManufacturerId")?.ToString();
+                if (mfgId != null) parts.Add($"MfgId: {mfgId}");
+                return new("TPM Status", Status.Pass, string.Join(" | ", parts));
+            }
+        }
+        catch { }
+
+        // Method 3: Get-Tpm (requires elevation, last resort)
+        try
+        {
+            string tpmInfo = RunProcess("powershell",
+                "-NoProfile -Command \"Get-Tpm | Select-Object -Property TpmPresent,TpmReady,TpmEnabled,ManufacturerVersion | Format-List\"");
+            var tpmPresent = Regex.Match(tpmInfo, @"TpmPresent\s*:\s*(\S+)");
+            var tpmReady = Regex.Match(tpmInfo, @"TpmReady\s*:\s*(\S+)");
+            var tpmEnabled = Regex.Match(tpmInfo, @"TpmEnabled\s*:\s*(\S+)");
+            var fwVer = Regex.Match(tpmInfo, @"ManufacturerVersion\s*:\s*(.+)");
+
+            bool present = tpmPresent.Success && tpmPresent.Groups[1].Value == "True";
+            bool ready = tpmReady.Success && tpmReady.Groups[1].Value == "True";
+            bool enabled = tpmEnabled.Success && tpmEnabled.Groups[1].Value == "True";
+
+            if (present && ready && enabled)
+            {
+                parts.Add("Present, enabled, ready");
+                if (!string.IsNullOrEmpty(tpmSpec)) parts.Add($"TPM {tpmSpec}");
+                if (fwVer.Success) parts.Add($"FW {fwVer.Groups[1].Value.Trim()}");
+                return new("TPM Status", Status.Pass, string.Join(" | ", parts));
+            }
+            else if (present)
+                return new("TPM Status", Status.Warn,
+                    $"Present but not ready (enabled={enabled}) - WHfB may fail provisioning");
+        }
+        catch { }
+
+        // Method 4: Check for TPM device driver (no elevation)
+        try
+        {
+            using var tpmDriver = Registry.LocalMachine.OpenSubKey(
+                @"SYSTEM\CurrentControlSet\Enum\ACPI\MSFT0101");
+            if (tpmDriver != null)
+                return new("TPM Status", Status.Pass, $"Present (ACPI\\MSFT0101){(!string.IsNullOrEmpty(tpmSpec) ? $" | TPM {tpmSpec}" : "")}");
+
+            using var tpmDriver2 = Registry.LocalMachine.OpenSubKey(
+                @"SYSTEM\CurrentControlSet\Enum\ACPI\INTC0102");
+            if (tpmDriver2 != null)
+                return new("TPM Status", Status.Pass, $"Present (Intel PTT){(!string.IsNullOrEmpty(tpmSpec) ? $" | TPM {tpmSpec}" : "")}");
+        }
+        catch { }
+
+        return new("TPM Status", Status.Fail,
+            "TPM not detected - WHfB requires TPM for key storage");
+    }
+
+    static bool TryTcpConnect(IPAddress? ip, string host, int port, int timeoutMs = 3000)
     {
         try
         {
             using var client = new TcpClient();
-            var task = client.ConnectAsync(host, port);
+            var task = ip != null ? client.ConnectAsync(ip, port) : client.ConnectAsync(host, port);
             return task.Wait(timeoutMs) && client.Connected;
         }
         catch { return false; }
@@ -1507,10 +2308,11 @@ class MainForm : Form
 // ── Data types ──────────────────────────────────────────
 
 enum Scenario { AD, Entra }
-record DiagConfig(string Server, string Domain, string Dc, string Share, Scenario Scenario);
+record DiagConfig(string Server, string Domain, string Dc, string Share, Scenario Scenario, bool PurgeTickets);
 enum Status { Pass, Fail, Warn, Skip }
 record TestEntry(string Name, Status Status = Status.Skip, string Detail = "");
 record TestGroup(string Name, List<TestEntry> Tests);
+record DiagRun(DateTime Timestamp, string Server, List<TestGroup> Results);
 
 // ── SSPI Interop ────────────────────────────────────────
 
