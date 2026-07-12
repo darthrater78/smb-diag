@@ -1183,7 +1183,13 @@ class MainForm : Form
                 "• Max Token Size — users in many groups need ≥48000 bytes\n" +
                 "  Fix: Increase MaxTokenSize in registry: HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Kerberos\\Parameters\\MaxTokenSize (DWORD, set to 65535). Also consider reducing group membership\n\n" +
                 "• DNS SRV Records — _kerberos._tcp.<domain> must resolve for automatic KDC discovery\n" +
-                "  Fix: Verify with 'nslookup -type=SRV _kerberos._tcp.<domain>'. If missing, check DNS zone replication and that the DC registered its SRV records (run 'nltest /dsregdns' on the DC)"));
+                "  Fix: Verify with 'nslookup -type=SRV _kerberos._tcp.<domain>'. If missing, check DNS zone replication and that the DC registered its SRV records (run 'nltest /dsregdns' on the DC)\n\n" +
+                "• LDAP SRV — _ldap._tcp.<domain> is how clients locate domain controllers for LDAP operations (domain joins, group policy, password changes)\n" +
+                "  Fix: Same as DNS SRV — check DNS zone replication and run 'nltest /dsregdns' on the DC. Missing LDAP SRV breaks DC locator\n\n" +
+                "• Global Catalog SRV (optional) — _gc._tcp.<domain> locates Global Catalog servers, used in multi-domain forests for cross-domain lookups and universal group membership\n" +
+                "  Fix: Only required in multi-domain forests. If missing, verify the DC is configured as a Global Catalog server in AD Sites and Services\n\n" +
+                "• kpasswd SRV (optional) — _kpasswd._tcp.<domain> advertises the Kerberos password change service (port 464). Windows clients typically change passwords via LDAP instead, so this is mainly relevant for non-Windows Kerberos clients (Linux, MIT Kerberos)\n" +
+                "  Fix: Rarely the cause of auth failures on Windows. If non-Windows clients can't change passwords, check that port 464 is reachable and the SRV record exists"));
 
             s.Add(("SSPI / SPNEGO Negotiation",
                 "Uses Windows SSPI API to acquire Negotiate credentials and generate a SPNEGO token. Tests the client-side auth pipeline without a server response.\n\n" +
@@ -1682,7 +1688,9 @@ class MainForm : Form
         {
             groups.Add(new("Kerberos Configuration", [
                 new("SPN Registration"), new("Allowed Enc Types"),
-                new("Max Token Size"), new("DNS SRV Records")
+                new("Max Token Size"), new("DNS SRV Records"),
+                new("LDAP SRV"), new("Global Catalog SRV"),
+                new("kpasswd SRV")
             ]));
         }
 
@@ -2463,7 +2471,33 @@ class MainForm : Form
             tests.Add(new("DNS SRV Records", Status.Warn, "nslookup not available"));
         }
 
+        tests.Add(LookupSrv($"_ldap._tcp.{cfg.Domain}", "LDAP SRV", required: true));
+        tests.Add(LookupSrv($"_gc._tcp.{cfg.Domain}", "Global Catalog SRV", required: false));
+        tests.Add(LookupSrv($"_kpasswd._tcp.{cfg.Domain}", "kpasswd SRV", required: false));
+
         return new("Kerberos Configuration", tests);
+    }
+
+    static TestEntry LookupSrv(string record, string testName, bool required)
+    {
+        try
+        {
+            string output = RunProcess("nslookup", $"-type=SRV {record}", timeoutMs: 5000);
+            bool found = output.Contains("service", StringComparison.OrdinalIgnoreCase)
+                      && output.Contains(record.Split('.', 3)[2], StringComparison.OrdinalIgnoreCase);
+            if (found)
+            {
+                var m = Regex.Match(output, @"svr hostname\s*=\s*(.+)", RegexOptions.IgnoreCase);
+                string host = m.Success ? m.Groups[1].Value.Trim() : "found";
+                return new(testName, Status.Pass, $"{record} -> {host}" + (required ? "" : " (optional — see guide)"));
+            }
+            return new(testName, required ? Status.Fail : Status.Warn,
+                $"No {record} record" + (required ? "" : " (optional — see guide)"));
+        }
+        catch
+        {
+            return new(testName, Status.Warn, "nslookup not available");
+        }
     }
 
     static TestGroup TestSmbConfig(DiagConfig cfg)

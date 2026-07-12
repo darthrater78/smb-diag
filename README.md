@@ -89,6 +89,9 @@ Parses `klist` output to examine the Kerberos ticket cache.
 - **Allowed Enc Types** — registry `SupportedEncryptionTypes`: AES required for modern DCs
 - **Max Token Size** — users in many groups need >=48000 bytes
 - **DNS SRV Records** — `_kerberos._tcp.<domain>` must resolve for automatic KDC discovery
+- **LDAP SRV** — `_ldap._tcp.<domain>` must resolve for DC locator (domain joins, group policy, password changes)
+- **Global Catalog SRV** (optional) — `_gc._tcp.<domain>` locates Global Catalog servers for cross-domain lookups in multi-domain forests
+- **kpasswd SRV** (optional) — `_kpasswd._tcp.<domain>` advertises the Kerberos password change service; mainly relevant for non-Windows Kerberos clients since Windows uses LDAP for password changes
 
 ### 4. SSPI / SPNEGO Negotiation
 
@@ -179,6 +182,7 @@ Output: `bin/Release/net8.0-windows/win-x64/publish/smb-diag.exe`
 
 | Version | Date | Changes |
 |---|---|---|
+| v1.2.1 | 2026-07-12 | Added LDAP SRV, Global Catalog SRV, and kpasswd SRV record checks to Kerberos Configuration (AD only); optional checks labeled with guide reference |
 | v1.2.0 | 2026-07-10 | Kerberos Tickets tab with klist viewer (ticket type badges, color-coded CIFS servers, Cache Flags, KDC Called), PRT status card from dsregcmd on Entra-joined devices, "What is this?" in-app explainer covering ticket types/Entra/PRT/delegation, domain suffix checkboxes on File Server and DC fields, GitHub and Release Notes links in header, purge moved to Tickets tab (removed from main page), removed Secure Channel test, settings moved to %LOCALAPPDATA%, ReadyToRun AOT for faster startup |
 | v1.1.0 | 2026-07-10 | Scenario auto-detection on startup, scenario-aware test skeletons, real-time streaming results, parallel test execution, troubleshooting guide with Fix tips per test, run history (5 per scenario), TPM/WHfB Config/Cloud AP/MDM tests, registry-based SMB version detection, single-instance mutex, SSPI buffer zeroing, process lifecycle cleanup, reduced timeouts |
 | v1.0.0 | 2026-07-09 | Initial release — dual-scenario diagnostics, SSPI negotiation testing, persistent input history, guide tabs, export |
