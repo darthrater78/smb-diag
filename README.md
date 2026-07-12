@@ -15,9 +15,9 @@ On first launch, Windows SmartScreen may display a warning ("Windows protected y
 1. Launch `smb-diag.exe`
 2. The app auto-detects your device join type (AD or Entra) on startup via `dsregcmd /status`
 3. Enter target details:
-   - **File Server** — hostname or FQDN (e.g. `files` or `files.contoso.com`). Check **+ domain suffix** to auto-append the domain.
+   - **File Server** — hostname or FQDN (e.g. `files` or `files.contoso.com`). **+ domain suffix** is on by default, auto-appending the domain to short names. Uncheck to use the value as-is.
    - **Domain** — e.g. `contoso.com`
-   - **DC Hostname** — optional, defaults to domain for KDC lookups. Check **+ domain suffix** to auto-append the domain.
+   - **DC Hostname** — optional, defaults to domain for KDC lookups. **+ domain suffix** is on by default, auto-appending the domain to short names. Uncheck to use the value as-is.
    - **Share Path** — optional share name for access test (e.g. `shared$`)
 4. Click **Run Diagnostics** — results stream in as each test group completes
 5. Review results or switch to the **Guide** tab for explanations, or **Kerberos Tickets** tab for live ticket cache and PRT status
@@ -88,12 +88,17 @@ Parses `klist` output to examine the Kerberos ticket cache.
 - **SPN Registration** — verifies `cifs/<server>` registered in AD via `setspn -Q`; falls back to cached service ticket verification if elevation is insufficient
 - **Allowed Enc Types** — registry `SupportedEncryptionTypes`: AES required for modern DCs
 - **Max Token Size** — users in many groups need >=48000 bytes
+
+### 4. DNS SRV Records
+
+Verifies DNS service discovery records required for Kerberos and Active Directory. Runs for both AD and Entra scenarios — Entra devices with Cloud Kerberos Trust still need these records to locate on-prem services.
+
 - **DNS SRV Records** — `_kerberos._tcp.<domain>` must resolve for automatic KDC discovery
 - **LDAP SRV** — `_ldap._tcp.<domain>` must resolve for DC locator (domain joins, group policy, password changes)
 - **Global Catalog SRV** (optional) — `_gc._tcp.<domain>` locates Global Catalog servers for cross-domain lookups in multi-domain forests
-- **kpasswd SRV** (optional) — `_kpasswd._tcp.<domain>` advertises the Kerberos password change service; mainly relevant for non-Windows Kerberos clients since Windows uses LDAP for password changes
+- **kpasswd SRV** (optional, AD only) — `_kpasswd._tcp.<domain>` advertises the Kerberos password change service; skipped for Entra since password changes go through Entra ID
 
-### 4. SSPI / SPNEGO Negotiation
+### 5. SSPI / SPNEGO Negotiation
 
 Uses Windows SSPI API (`secur32.dll`) to test the complete client-side authentication pipeline.
 
@@ -103,7 +108,7 @@ Uses Windows SSPI API (`secur32.dll`) to test the complete client-side authentic
 - **Token <= 256 bytes** = NTLM fallback (Type 1 negotiate message)
 - `SEC_I_CONTINUE_NEEDED` (0x00090312) is the expected success status
 
-### 5. Network Path
+### 6. Network Path
 
 Tests connectivity to services required for SMB authentication. Port checks run in parallel.
 
@@ -117,18 +122,18 @@ Tests connectivity to services required for SMB authentication. Port checks run 
 - **DNS Suffix** — warns if domain is not in the DNS suffix search list
 - **IPv6 Status** — dual-stack, IPv4-only, or IPv6-only detection
 
-### 6. SMB Configuration
+### 7. SMB Configuration
 
 - **LmCompatibility Level** — Level 3+ (NTLMv2 only) recommended; shows "(OS default)" when not explicitly set (AD only)
 - **SMB Signing** — Required prevents MITM; Enabled allows but doesn't enforce
 - **SMB Versions** — SMBv1 should be disabled; SMBv2/3 required. Detected via registry (mrxsmb10 driver, LanmanServer SMB1/SMB2 values)
 - **Guest Fallback** — AllowInsecureGuestAuth should be disabled (secure default)
 
-### 7. Share Access
+### 8. Share Access
 
 - **Share Access Test** — `net use` to configured UNC path with automatic cleanup via `net use /delete`
 
-### 8. Credential Store
+### 9. Credential Store
 
 - **Credential Manager** — queries `cmdkey /list` for saved credentials (AD only). Absence is normal — Kerberos SSO doesn't require saved credentials
 - **NTLM Hash Available** — generates an NTLM token via SSPI to definitively test whether the password hash is cached in LSASS. More reliable than registry checks
@@ -182,6 +187,7 @@ Output: `bin/Release/net8.0-windows/win-x64/publish/smb-diag.exe`
 
 | Version | Date | Changes |
 |---|---|---|
+| v1.3.0 | 2026-07-12 | DNS SRV Records split into its own test group, now runs for both AD and Entra scenarios (Entra devices with Cloud Kerberos Trust need _kerberos._tcp and _ldap._tcp for on-prem service access); kpasswd SRV skipped for Entra (password changes go through Entra ID); domain suffix checkboxes now on by default with improved readability |
 | v1.2.1 | 2026-07-12 | Added LDAP SRV, Global Catalog SRV, and kpasswd SRV record checks to Kerberos Configuration (AD only); optional checks labeled with guide reference |
 | v1.2.0 | 2026-07-10 | Kerberos Tickets tab with klist viewer (ticket type badges, color-coded CIFS servers, Cache Flags, KDC Called), PRT status card from dsregcmd on Entra-joined devices, "What is this?" in-app explainer covering ticket types/Entra/PRT/delegation, domain suffix checkboxes on File Server and DC fields, GitHub and Release Notes links in header, purge moved to Tickets tab (removed from main page), removed Secure Channel test, settings moved to %LOCALAPPDATA%, ReadyToRun AOT for faster startup |
 | v1.1.0 | 2026-07-10 | Scenario auto-detection on startup, scenario-aware test skeletons, real-time streaming results, parallel test execution, troubleshooting guide with Fix tips per test, run history (5 per scenario), TPM/WHfB Config/Cloud AP/MDM tests, registry-based SMB version detection, single-instance mutex, SSPI buffer zeroing, process lifecycle cleanup, reduced timeouts |
