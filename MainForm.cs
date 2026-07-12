@@ -162,15 +162,9 @@ class MainForm : Form
         _txtDc = MakeInput(configPanel, "DC HOSTNAME", 0, 1);
         _txtShare = MakeInput(configPanel, "SHARE PATH", 1, 1);
 
-        _chkServerSuffix = new CheckBox { Text = "+ domain suffix", ForeColor = DimColor, Font = new Font("Segoe UI", 7f), AutoSize = true, FlatStyle = FlatStyle.Flat, Location = new Point(130, 2) };
-        _chkDcSuffix = new CheckBox { Text = "+ domain suffix", ForeColor = DimColor, Font = new Font("Segoe UI", 7f), AutoSize = true, FlatStyle = FlatStyle.Flat, Location = new Point(130, 42) };
+        _chkServerSuffix = new CheckBox { Text = "+ domain suffix", ForeColor = Color.White, Font = new Font("Segoe UI", 7.5f, FontStyle.Bold), AutoSize = true, FlatStyle = FlatStyle.Flat, Checked = true, Location = new Point(100, 2) };
+        _chkDcSuffix = new CheckBox { Text = "+ domain suffix", ForeColor = Color.White, Font = new Font("Segoe UI", 7.5f, FontStyle.Bold), AutoSize = true, FlatStyle = FlatStyle.Flat, Checked = true, Location = new Point(110, 42) };
         configPanel.Controls.AddRange([_chkServerSuffix, _chkDcSuffix]);
-        configPanel.Resize += (s, e) =>
-        {
-            int halfW = configPanel.ClientSize.Width / 2;
-            _chkServerSuffix.Location = new Point(halfW - _chkServerSuffix.Width - 14, 2);
-            _chkDcSuffix.Location = new Point(halfW - _chkDcSuffix.Width - 14, 42);
-        };
 
         layout.Controls.Add(configPanel, 0, 1);
 
@@ -382,10 +376,10 @@ class MainForm : Form
                 _scenarioIndex = idx;
                 StyleScenarioButtons();
             }
-            if (s.TryGetValue("serverSuffix", out var ss) && ss.ValueKind == JsonValueKind.True)
-                _chkServerSuffix.Checked = true;
-            if (s.TryGetValue("dcSuffix", out var ds) && ds.ValueKind == JsonValueKind.True)
-                _chkDcSuffix.Checked = true;
+            if (s.TryGetValue("serverSuffix", out var ss))
+                _chkServerSuffix.Checked = ss.ValueKind == JsonValueKind.True;
+            if (s.TryGetValue("dcSuffix", out var ds))
+                _chkDcSuffix.Checked = ds.ValueKind == JsonValueKind.True;
         }
         catch { }
     }
@@ -1175,20 +1169,23 @@ class MainForm : Form
                 "  Fix: Enable AES on the file server's AD computer account and update GPO SupportedEncryptionTypes to include AES (0x18 or higher)"));
 
             s.Add(("Kerberos Configuration",
-                "Checks Active Directory and client Kerberos settings:\n\n" +
+                "Checks Active Directory and client Kerberos settings (AD only):\n\n" +
                 "• SPN Registration — verifies cifs/<server> registered in AD via 'setspn -Q'\n" +
                 "  Fix: Register the SPN: 'setspn -S cifs/<server-fqdn> <computer-account>' (domain admin required). Check for duplicate SPNs with 'setspn -X'\n\n" +
                 "• Allowed Enc Types — registry SupportedEncryptionTypes: 0x18 = AES\n" +
                 "  Fix: Set via GPO: Computer Config > Policies > Windows Settings > Security Settings > Local Policies > Security Options > 'Network security: Configure encryption types allowed for Kerberos'\n\n" +
                 "• Max Token Size — users in many groups need ≥48000 bytes\n" +
-                "  Fix: Increase MaxTokenSize in registry: HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Kerberos\\Parameters\\MaxTokenSize (DWORD, set to 65535). Also consider reducing group membership\n\n" +
-                "• DNS SRV Records — _kerberos._tcp.<domain> must resolve for automatic KDC discovery\n" +
+                "  Fix: Increase MaxTokenSize in registry: HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Kerberos\\Parameters\\MaxTokenSize (DWORD, set to 65535). Also consider reducing group membership"));
+
+            s.Add(("DNS SRV Records",
+                "Verifies DNS service discovery records required for Kerberos and Active Directory. These records are used by both AD-joined and Entra-joined devices to locate on-prem services.\n\n" +
+                "• DNS SRV Records — _kerberos._tcp.<domain> must resolve for automatic KDC discovery. Entra devices with Cloud Kerberos Trust need this for on-prem service ticket requests\n" +
                 "  Fix: Verify with 'nslookup -type=SRV _kerberos._tcp.<domain>'. If missing, check DNS zone replication and that the DC registered its SRV records (run 'nltest /dsregdns' on the DC)\n\n" +
                 "• LDAP SRV — _ldap._tcp.<domain> is how clients locate domain controllers for LDAP operations (domain joins, group policy, password changes)\n" +
                 "  Fix: Same as DNS SRV — check DNS zone replication and run 'nltest /dsregdns' on the DC. Missing LDAP SRV breaks DC locator\n\n" +
                 "• Global Catalog SRV (optional) — _gc._tcp.<domain> locates Global Catalog servers, used in multi-domain forests for cross-domain lookups and universal group membership\n" +
                 "  Fix: Only required in multi-domain forests. If missing, verify the DC is configured as a Global Catalog server in AD Sites and Services\n\n" +
-                "• kpasswd SRV (optional) — _kpasswd._tcp.<domain> advertises the Kerberos password change service (port 464). Windows clients typically change passwords via LDAP instead, so this is mainly relevant for non-Windows Kerberos clients (Linux, MIT Kerberos)\n" +
+                "• kpasswd SRV (optional, AD only) — _kpasswd._tcp.<domain> advertises the Kerberos password change service (port 464). Windows clients typically change passwords via LDAP instead, so this is mainly relevant for non-Windows Kerberos clients (Linux, MIT Kerberos). Skipped for Entra — password changes go through Entra ID, not the on-prem KDC\n" +
                 "  Fix: Rarely the cause of auth failures on Windows. If non-Windows clients can't change passwords, check that port 464 is reachable and the SRV record exists"));
 
             s.Add(("SSPI / SPNEGO Negotiation",
@@ -1451,6 +1448,10 @@ class MainForm : Form
             ReplaceGroup("Kerberos Configuration", kerbConfig);
         }
 
+        var srvResult = await Task.Run(() => TestDnsSrvRecords(config));
+        if (cts.IsCancellationRequested || IsDisposed) return;
+        ReplaceGroup("DNS SRV Records", srvResult);
+
         _lastResults = results;
         history[0] = new DiagRun(DateTime.Now, server, results);
         if (history.Count > 5) history.RemoveAt(5);
@@ -1688,11 +1689,13 @@ class MainForm : Form
         {
             groups.Add(new("Kerberos Configuration", [
                 new("SPN Registration"), new("Allowed Enc Types"),
-                new("Max Token Size"), new("DNS SRV Records"),
-                new("LDAP SRV"), new("Global Catalog SRV"),
-                new("kpasswd SRV")
+                new("Max Token Size")
             ]));
         }
+
+        var srvTests = new List<TestEntry> { new("DNS SRV Records"), new("LDAP SRV"), new("Global Catalog SRV") };
+        if (!isEntra) srvTests.Add(new("kpasswd SRV"));
+        groups.Add(new("DNS SRV Records", srvTests));
 
         groups.Add(new("SSPI / SPNEGO Negotiation", [
             new("AcquireCredentials"), new("SPNEGO Rounds"),
@@ -2451,31 +2454,20 @@ class MainForm : Form
             tests.Add(new("Max Token Size", Status.Skip, "Cannot read registry"));
         }
 
-        try
-        {
-            string nslookup = RunProcess("nslookup", $"-type=SRV _kerberos._tcp.{cfg.Domain}", timeoutMs: 5000);
-            bool hasSrv = nslookup.Contains("service", StringComparison.OrdinalIgnoreCase)
-                       && nslookup.Contains(cfg.Domain, StringComparison.OrdinalIgnoreCase);
-            if (hasSrv)
-            {
-                var srvMatch = Regex.Match(nslookup, @"svr hostname\s*=\s*(.+)", RegexOptions.IgnoreCase);
-                string host = srvMatch.Success ? srvMatch.Groups[1].Value.Trim() : "found";
-                tests.Add(new("DNS SRV Records", Status.Pass, $"_kerberos._tcp.{cfg.Domain} -> {host}"));
-            }
-            else
-                tests.Add(new("DNS SRV Records", Status.Fail,
-                    $"No _kerberos._tcp.{cfg.Domain} SRV record - KDC auto-discovery broken"));
-        }
-        catch
-        {
-            tests.Add(new("DNS SRV Records", Status.Warn, "nslookup not available"));
-        }
+        return new("Kerberos Configuration", tests);
+    }
 
+    static TestGroup TestDnsSrvRecords(DiagConfig cfg)
+    {
+        var tests = new List<TestEntry>();
+
+        tests.Add(LookupSrv($"_kerberos._tcp.{cfg.Domain}", "DNS SRV Records", required: true));
         tests.Add(LookupSrv($"_ldap._tcp.{cfg.Domain}", "LDAP SRV", required: true));
         tests.Add(LookupSrv($"_gc._tcp.{cfg.Domain}", "Global Catalog SRV", required: false));
-        tests.Add(LookupSrv($"_kpasswd._tcp.{cfg.Domain}", "kpasswd SRV", required: false));
+        if (cfg.Scenario != Scenario.Entra)
+            tests.Add(LookupSrv($"_kpasswd._tcp.{cfg.Domain}", "kpasswd SRV", required: false));
 
-        return new("Kerberos Configuration", tests);
+        return new("DNS SRV Records", tests);
     }
 
     static TestEntry LookupSrv(string record, string testName, bool required)
