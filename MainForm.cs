@@ -97,8 +97,9 @@ class MainForm : Form
         ForeColor = TextColor;
         Font = new Font("Segoe UI", 9f);
         DoubleBuffered = true;
-        var icoPath = Path.Combine(AppContext.BaseDirectory, "app.ico");
-        if (File.Exists(icoPath)) Icon = new Icon(icoPath);
+        var exePath = Environment.ProcessPath ?? Application.ExecutablePath;
+        var extracted = Icon.ExtractAssociatedIcon(exePath);
+        if (extracted != null) Icon = extracted;
 
         var mainPanel = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = Padding.Empty };
         var layout = new TableLayoutPanel
