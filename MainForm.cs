@@ -72,7 +72,7 @@ class MainForm : Form
     readonly CheckBox _chkServerSuffix, _chkDcSuffix;
     readonly Button _btnAD, _btnEntra;
     int _scenarioIndex;
-    readonly Button _btnRun, _btnExport, _btnClear, _btnOpenShare, _btnTabResults, _btnTabGuide, _btnTabTickets, _btnPurgeTickets;
+    readonly Button _btnRun, _btnExport, _btnClear, _btnReset, _btnOpenShare, _btnTabResults, _btnTabGuide, _btnTabTickets, _btnPurgeTickets;
     readonly Label _lblStatus, _lblPassCount, _lblFailCount, _lblWarnCount;
     readonly Panel _summaryPanel, _resultsCanvas, _resultsScrollPanel, _historyPanel, _ticketsPanel;
     readonly RichTextBox _guideBox, _ticketsBox;
@@ -181,14 +181,14 @@ class MainForm : Form
         _btnClear = new Button { Text = "Clear Results", BackColor = SurfaceColor, ForeColor = DimColor, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9f), Size = new Size(100, 26), Location = new Point(266, 4), Cursor = Cursors.Hand };
         _btnClear.FlatAppearance.BorderColor = BorderColor;
         _btnClear.Click += BtnClear_Click;
-        var btnReset = new Button { Text = "Reset All", BackColor = SurfaceColor, ForeColor = FailColor, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9f), Size = new Size(75, 26), Location = new Point(374, 4), Cursor = Cursors.Hand };
-        btnReset.FlatAppearance.BorderColor = BorderColor;
-        btnReset.Click += BtnReset_Click;
+        _btnReset = new Button { Text = "Reset All", BackColor = SurfaceColor, ForeColor = FailColor, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9f), Size = new Size(75, 26), Location = new Point(374, 4), Cursor = Cursors.Hand };
+        _btnReset.FlatAppearance.BorderColor = BorderColor;
+        _btnReset.Click += BtnReset_Click;
         _btnOpenShare = new Button { Text = "Open Share", BackColor = SurfaceColor, ForeColor = DimColor, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9f), Size = new Size(90, 26), Location = new Point(457, 4), Cursor = Cursors.Hand, Enabled = false };
         _btnOpenShare.FlatAppearance.BorderColor = BorderColor;
         _btnOpenShare.Click += BtnOpenShare_Click;
         _lblStatus = new Label { ForeColor = DimColor, Font = new Font("Segoe UI", 8.5f), AutoSize = false, Location = new Point(555, 4), Size = new Size(300, 28), Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right };
-        actionsPanel.Controls.AddRange([_btnRun, _btnExport, _btnClear, btnReset, _btnOpenShare, _lblStatus]);
+        actionsPanel.Controls.AddRange([_btnRun, _btnExport, _btnClear, _btnReset, _btnOpenShare, _lblStatus]);
         layout.Controls.Add(actionsPanel, 0, 2);
 
         // Summary bar
@@ -220,7 +220,7 @@ class MainForm : Form
         _btnTabTickets = new Button { Text = "Kerberos Tickets", FlatStyle = FlatStyle.Flat, BackColor = BgColor, ForeColor = DimColor, Font = new Font("Segoe UI", 8.5f), Size = new Size(120, 26), Location = new Point(178, 2), Cursor = Cursors.Hand };
         _btnTabTickets.FlatAppearance.BorderColor = BorderColor;
         _btnTabTickets.FlatAppearance.BorderSize = 1;
-        _btnTabTickets.Click += (s, e) => { SwitchTab("tickets"); RefreshTickets(); };
+        _btnTabTickets.Click += async (s, e) => { SwitchTab("tickets"); await RefreshTicketsAsync(); };
         tabBar.Controls.AddRange([_btnTabResults, _btnTabGuide, _btnTabTickets]);
 
         // Results canvas (owner-drawn, no more FlowLayoutPanel)
@@ -271,10 +271,10 @@ class MainForm : Form
         _btnPurgeTickets.Click += BtnPurgeTickets_Click;
         var ticketsRefreshBtn = new Button { Text = "Refresh", BackColor = SurfaceColor, ForeColor = DimColor, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9f), Size = new Size(80, 28), Dock = DockStyle.Bottom, Cursor = Cursors.Hand };
         ticketsRefreshBtn.FlatAppearance.BorderColor = BorderColor;
-        ticketsRefreshBtn.Click += (s, e) => RefreshTickets();
+        ticketsRefreshBtn.Click += async (s, e) => await RefreshTicketsAsync();
         var ticketsInfoBtn = new Button { Text = "What is this?", BackColor = SurfaceColor, ForeColor = AccentColor, FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9f), Size = new Size(100, 28), Cursor = Cursors.Hand };
         ticketsInfoBtn.FlatAppearance.BorderColor = BorderColor;
-        ticketsInfoBtn.Click += (s, e) => { if (_showingExplainer) { _showingExplainer = false; RefreshTickets(); } else ShowTicketsExplainer(); };
+        ticketsInfoBtn.Click += async (s, e) => { if (_showingExplainer) { _showingExplainer = false; await RefreshTicketsAsync(); } else ShowTicketsExplainer(); };
         var ticketsBtnPanel = new Panel { Height = 34, Dock = DockStyle.Bottom, BackColor = BgColor };
         _btnPurgeTickets.Dock = DockStyle.None;
         ticketsRefreshBtn.Dock = DockStyle.None;
@@ -517,7 +517,10 @@ class MainForm : Form
 
     void BtnOpenShare_Click(object? sender, EventArgs e)
     {
+        string domain = _txtDomain.Text.Trim();
         string server = _txtServer.Text.Trim();
+        if (_chkServerSuffix.Checked && !string.IsNullOrEmpty(domain) && !server.Contains('.'))
+            server = $"{server}.{domain}";
         string share = _txtShare.Text.Trim();
         if (string.IsNullOrEmpty(server))
         {
@@ -580,10 +583,10 @@ class MainForm : Form
         Color.FromArgb(0xd1, 0x9a, 0x66), // orange
     ];
 
-    void RenderPrtStatus()
+    async Task RenderPrtStatusAsync()
     {
         string dsreg;
-        try { dsreg = RunProcess("dsregcmd", "/status", timeoutMs: 5000); }
+        try { dsreg = await Task.Run(() => RunProcess("dsregcmd", "/status", timeoutMs: 5000)); }
         catch { return; }
 
         bool aadJoined = Regex.IsMatch(dsreg, @"AzureAdJoined\s*:\s*YES", RegexOptions.IgnoreCase);
@@ -658,13 +661,13 @@ class MainForm : Form
 
     bool _cloudKerbTrust;
 
-    void RefreshTickets()
+    async Task RefreshTicketsAsync()
     {
         _ticketsBox.Clear();
         _cloudKerbTrust = false;
-        RenderPrtStatus();
+        await RenderPrtStatusAsync();
         string raw;
-        try { raw = RunProcess("klist", "", timeoutMs: 5000); }
+        try { raw = await Task.Run(() => RunProcess("klist", "", timeoutMs: 5000)); }
         catch (Exception ex) { AppendTicketsLine($"Error running klist: {ex.Message}\n", DimColor); return; }
 
         if (string.IsNullOrWhiteSpace(raw) || raw.Contains("no credentials", StringComparison.OrdinalIgnoreCase))
@@ -697,7 +700,12 @@ class MainForm : Form
                     tickets.Add((currentServer, new Dictionary<string, string>(fields, StringComparer.OrdinalIgnoreCase)));
                 currentServer = null;
                 fields.Clear();
-                continue;
+
+                // klist prints the Client field on the same line as the "#N>" ticket marker,
+                // e.g. "#0>     Client: user @ REALM.COM" — parse the remainder as a normal field.
+                int markerEnd = line.IndexOf('>');
+                if (markerEnd < 0 || markerEnd + 1 >= line.Length) continue;
+                line = line[(markerEnd + 1)..];
             }
 
             var kv = line.Split(':', 2);
@@ -961,7 +969,7 @@ class MainForm : Form
         _ticketsBox.AppendText(text);
     }
 
-    void BtnPurgeTickets_Click(object? sender, EventArgs e)
+    async void BtnPurgeTickets_Click(object? sender, EventArgs e)
     {
         var confirm = MessageBox.Show(
             "This will destroy all cached Kerberos tickets.\n\n"
@@ -973,10 +981,10 @@ class MainForm : Form
 
         try
         {
-            RunProcess("klist", "purge", timeoutMs: 5000);
+            await Task.Run(() => RunProcess("klist", "purge", timeoutMs: 5000));
             _lblStatus.Text = "Tickets purged — run diagnostics twice (first run reacquires tickets, second shows true results)";
             _lblStatus.ForeColor = WarnColor;
-            RefreshTickets();
+            await RefreshTicketsAsync();
         }
         catch (Exception ex)
         {
@@ -1383,6 +1391,10 @@ class MainForm : Form
 
         _btnRun.Enabled = false;
         _btnExport.Enabled = false;
+        _btnClear.Enabled = false;
+        _btnReset.Enabled = false;
+        _btnAD.Enabled = false;
+        _btnEntra.Enabled = false;
         _summaryPanel.Visible = false;
         _lblStatus.ForeColor = DimColor;
         _lblStatus.Text = "Running diagnostics...";
@@ -1393,9 +1405,17 @@ class MainForm : Form
         RenderResults(results, running: true);
 
         var history = _runHistory[_scenarioIndex];
-        history.Insert(0, new DiagRun(DateTime.MinValue, server, results));
+        var pendingEntry = new DiagRun(DateTime.MinValue, server, results);
+        history.Insert(0, pendingEntry);
         _selectedRunIndex = 0;
         RebuildHistoryBar();
+
+        void CancelCleanup()
+        {
+            if (IsDisposed) return;
+            history.Remove(pendingEntry);
+            RebuildHistoryBar();
+        }
 
         var config = new DiagConfig(server, domain, dc, share, scenario);
         int completed = 0;
@@ -1403,12 +1423,12 @@ class MainForm : Form
 
         void ReplaceGroup(string name, TestGroup result)
         {
-            if (cts.IsCancellationRequested || IsDisposed) return;
+            if (cts.IsCancellationRequested || IsDisposed) { CancelCleanup(); return; }
             int idx = results.FindIndex(g => g.Name == name);
             if (idx >= 0) results[idx] = result;
             completed++;
             _lblStatus.Text = $"Running diagnostics... ({completed}/{totalGroups})";
-            ShowResults(results);
+            RenderResults(results, running: true);
         }
 
         var identityTask = Task.Run(() => TestDeviceIdentity(config));
@@ -1433,7 +1453,7 @@ class MainForm : Form
         while (pending.Count > 0)
         {
             var done = await Task.WhenAny(pending.Select(p => p.task));
-            if (cts.IsCancellationRequested || IsDisposed) return;
+            if (cts.IsCancellationRequested || IsDisposed) { CancelCleanup(); return; }
             var match = pending.First(p => p.task == done);
             pending.Remove(match);
             ReplaceGroup(match.name, match.getResult());
@@ -1445,12 +1465,12 @@ class MainForm : Form
             bool hasCifsTicket = kerbGroup.Tests.Any(t =>
                 t.Name == "cifs/ Service Ticket" && t.Status == Status.Pass);
             var kerbConfig = await Task.Run(() => TestKerberosConfig(config, hasCifsTicket));
-            if (cts.IsCancellationRequested || IsDisposed) return;
+            if (cts.IsCancellationRequested || IsDisposed) { CancelCleanup(); return; }
             ReplaceGroup("Kerberos Configuration", kerbConfig);
         }
 
         var srvResult = await Task.Run(() => TestDnsSrvRecords(config));
-        if (cts.IsCancellationRequested || IsDisposed) return;
+        if (cts.IsCancellationRequested || IsDisposed) { CancelCleanup(); return; }
         ReplaceGroup("DNS SRV Records", srvResult);
 
         _lastResults = results;
@@ -1464,6 +1484,10 @@ class MainForm : Form
         _lblStatus.Text = "Complete";
         _btnRun.Enabled = true;
         _btnExport.Enabled = true;
+        _btnClear.Enabled = true;
+        _btnReset.Enabled = true;
+        _btnAD.Enabled = true;
+        _btnEntra.Enabled = true;
         _btnOpenShare.Enabled = true;
     }
 
@@ -1495,6 +1519,7 @@ class MainForm : Form
             _summaryPanel.Visible = false;
             _lblStatus.Text = "";
             _btnExport.Enabled = false;
+            _btnOpenShare.Enabled = false;
         }
         RebuildHistoryBar();
     }
@@ -2644,10 +2669,12 @@ class MainForm : Form
         using var proc = Process.Start(psi)
             ?? throw new InvalidOperationException($"Failed to start {fileName}");
         var outputTask = proc.StandardOutput.ReadToEndAsync();
+        var errorTask = proc.StandardError.ReadToEndAsync();
         if (!proc.WaitForExit(timeoutMs))
         {
             try { proc.Kill(true); } catch { }
         }
+        Task.WaitAll(outputTask, errorTask);
         return outputTask.GetAwaiter().GetResult();
     }
 
@@ -2766,13 +2793,20 @@ class MainForm : Form
 
     static string? ReadRegistryString(string fullPath, string valueName)
     {
-        string hivePath = fullPath;
-        RegistryKey? root = null;
-        if (hivePath.StartsWith(@"HKLM\")) { root = Registry.LocalMachine; hivePath = hivePath[5..]; }
-        else if (hivePath.StartsWith(@"HKCU\")) { root = Registry.CurrentUser; hivePath = hivePath[5..]; }
-        if (root == null) return null;
-        using var key = root.OpenSubKey(hivePath);
-        return key?.GetValue(valueName)?.ToString();
+        try
+        {
+            string hivePath = fullPath;
+            RegistryKey? root = null;
+            if (hivePath.StartsWith(@"HKLM\")) { root = Registry.LocalMachine; hivePath = hivePath[5..]; }
+            else if (hivePath.StartsWith(@"HKCU\")) { root = Registry.CurrentUser; hivePath = hivePath[5..]; }
+            if (root == null) return null;
+            using var key = root.OpenSubKey(hivePath);
+            return key?.GetValue(valueName)?.ToString();
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     static string DescribeHResult(int hr)
