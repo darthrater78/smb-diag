@@ -169,7 +169,7 @@ Tests connectivity to services required for SMB authentication. Port checks run 
 | `tpmtool getdeviceinformation` | TPM detection | 5s |
 | `net use` / `net use /delete` | Share access test | 8s / 3s |
 
-All launched with `CreateNoWindow`, `UseShellExecute=false`, `RedirectStandardOutput`, async stdout read, killed on timeout.
+All launched with `CreateNoWindow`, `UseShellExecute=false`, `RedirectStandardOutput/Error`, async stdout+stderr drain, killed on timeout.
 
 ## Build from Source
 
@@ -187,6 +187,7 @@ Output: `bin/Release/net8.0-windows/win-x64/publish/smb-diag.exe`
 
 | Version | Date | Changes |
 |---|---|---|
+| v1.3.1 | 2026-07-16 | Fix crash when clicking Clear/Reset mid-run; fix stale "Pending..." history entries on cancelled runs; fix "running..." indicator turning off too early; fix klist Client field not parsing; fix WHfB duplicate entries on registry access failure; fix Open Share ignoring domain suffix; async Kerberos Tickets tab (no more UI freeze); drain stderr in RunProcess to prevent pipe-buffer deadlock; disable action buttons during diagnostic run to prevent data corruption; reentrancy guard on ticket refresh; extract shared suffix helper |
 | v1.3.0 | 2026-07-12 | DNS SRV Records split into its own test group, now runs for both AD and Entra scenarios (Entra devices with Cloud Kerberos Trust need _kerberos._tcp and _ldap._tcp for on-prem service access); kpasswd SRV skipped for Entra (password changes go through Entra ID); domain suffix checkboxes now on by default with improved readability |
 | v1.2.1 | 2026-07-12 | Added LDAP SRV, Global Catalog SRV, and kpasswd SRV record checks to Kerberos Configuration (AD only); optional checks labeled with guide reference |
 | v1.2.0 | 2026-07-10 | Kerberos Tickets tab with klist viewer (ticket type badges, color-coded CIFS servers, Cache Flags, KDC Called), PRT status card from dsregcmd on Entra-joined devices, "What is this?" in-app explainer covering ticket types/Entra/PRT/delegation, domain suffix checkboxes on File Server and DC fields, GitHub and Release Notes links in header, purge moved to Tickets tab (removed from main page), removed Secure Channel test, settings moved to %LOCALAPPDATA%, ReadyToRun AOT for faster startup |
