@@ -78,7 +78,7 @@ class MainForm : Form
     readonly RichTextBox _guideBox, _ticketsBox;
     List<TestGroup>? _lastResults;
     List<TestGroup>? _renderedGroups;
-    bool _renderRunning, _showingExplainer;
+    bool _renderRunning, _showingExplainer, _refreshingTickets;
     string? _placeholderText;
     readonly Dictionary<int, List<DiagRun>> _runHistory = new() { [0] = [], [1] = [] };
     int _selectedRunIndex = -1;
@@ -86,6 +86,9 @@ class MainForm : Form
 
     static string SettingsPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "smb-diag", "settings.json");
+
+    static string ApplySuffix(string host, string domain, bool suffixEnabled) =>
+        suffixEnabled && !string.IsNullOrEmpty(domain) && !host.Contains('.') ? $"{host}.{domain}" : host;
 
     public MainForm()
     {
@@ -122,7 +125,7 @@ class MainForm : Form
         var header = new Panel { Height = 34, Dock = DockStyle.Fill };
         header.Paint += (s, e) => e.Graphics.DrawLine(BorderPen, 0, header.Height - 1, header.Width, header.Height - 1);
         var lblTitle = new Label { Text = "SMB Auth Diagnostics", ForeColor = TextColor, Font = new Font("Segoe UI", 11f, FontStyle.Bold), AutoSize = true, Location = new Point(10, 6) };
-        var lblTag = new Label { Text = " v1.2.0 ", ForeColor = AccentColor, BackColor = AccentDimColor, Font = new Font("Segoe UI", 7.5f, FontStyle.Bold), AutoSize = true, Location = new Point(192, 10) };
+        var lblTag = new Label { Text = " v1.3.1 ", ForeColor = AccentColor, BackColor = AccentDimColor, Font = new Font("Segoe UI", 7.5f, FontStyle.Bold), AutoSize = true, Location = new Point(192, 10) };
         _btnAD = new Button
         {
             Text = "AD Joined", FlatStyle = FlatStyle.Flat,
@@ -518,9 +521,7 @@ class MainForm : Form
     void BtnOpenShare_Click(object? sender, EventArgs e)
     {
         string domain = _txtDomain.Text.Trim();
-        string server = _txtServer.Text.Trim();
-        if (_chkServerSuffix.Checked && !string.IsNullOrEmpty(domain) && !server.Contains('.'))
-            server = $"{server}.{domain}";
+        string server = ApplySuffix(_txtServer.Text.Trim(), domain, _chkServerSuffix.Checked);
         string share = _txtShare.Text.Trim();
         if (string.IsNullOrEmpty(server))
         {
@@ -663,6 +664,10 @@ class MainForm : Form
 
     async Task RefreshTicketsAsync()
     {
+        if (_refreshingTickets) return;
+        _refreshingTickets = true;
+        try
+        {
         _ticketsBox.Clear();
         _cloudKerbTrust = false;
         await RenderPrtStatusAsync();
@@ -748,6 +753,8 @@ class MainForm : Form
 
         if (tickets.Count == 0)
             AppendTicketsLine("No Kerberos tickets cached.\n", DimColor);
+        }
+        finally { _refreshingTickets = false; }
     }
 
     void RenderTicket(string server, Dictionary<string, string> fields, int index, Dictionary<string, Color> cifsColorMap)
@@ -1354,12 +1361,8 @@ class MainForm : Form
     async void BtnRun_Click(object? sender, EventArgs e)
     {
         string domain = _txtDomain.Text.Trim();
-        string server = _txtServer.Text.Trim();
-        if (_chkServerSuffix.Checked && !string.IsNullOrEmpty(domain) && !server.Contains('.'))
-            server = $"{server}.{domain}";
-        string dc = _txtDc.Text.Trim();
-        if (_chkDcSuffix.Checked && !string.IsNullOrEmpty(domain) && !dc.Contains('.'))
-            dc = $"{dc}.{domain}";
+        string server = ApplySuffix(_txtServer.Text.Trim(), domain, _chkServerSuffix.Checked);
+        string dc = ApplySuffix(_txtDc.Text.Trim(), domain, _chkDcSuffix.Checked);
         string share = _txtShare.Text.Trim();
 
         if (string.IsNullOrEmpty(server) || string.IsNullOrEmpty(domain))
@@ -2803,10 +2806,8 @@ class MainForm : Form
             using var key = root.OpenSubKey(hivePath);
             return key?.GetValue(valueName)?.ToString();
         }
-        catch
-        {
-            return null;
-        }
+        catch (System.Security.SecurityException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
     }
 
     static string DescribeHResult(int hr)
