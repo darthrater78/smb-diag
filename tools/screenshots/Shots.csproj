@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Screenshot harness: the app's own MainForm with a separate entry point that loads mock data.
+       Run through run.sh (Wine + Xvfb); see README.md in this folder. Not part of the shipped app. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <AssemblyName>smb-diag</AssemblyName>
+    <RootNamespace>SmbDiag</RootNamespace>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <StartupObject>SmbDiag.Shots</StartupObject>
+    <ApplicationIcon>../../app.ico</ApplicationIcon>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../MainForm.cs" />
+  </ItemGroup>
+</Project>
