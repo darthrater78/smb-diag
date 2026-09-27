@@ -7,7 +7,7 @@ All notable changes to this project are documented here. The format follows
 Releases up to 1.3.1 are listed in the README's Version History and on the
 [GitHub releases page](https://github.com/darthrater78/smb-diag/releases).
 
-## [Unreleased]
+## [1.3.2] - 2026-09-27
 
 ### Security
 - System tools (`klist`, `net`, `nslookup`, `powershell`, …) are now launched by
