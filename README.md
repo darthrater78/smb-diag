@@ -2,6 +2,8 @@
 
 Standalone Windows diagnostic tool that tests the full SMB/Kerberos authentication chain. Single-exe, no install required.
 
+![Results for an AD-joined device](docs/screenshots/results-ad.png)
+
 ## Download
 
 Grab `smb-diag.exe` from the [latest release](https://github.com/darthrater78/smb-diag/releases/latest). No installation — just run. Source: [github.com/darthrater78/smb-diag](https://github.com/darthrater78/smb-diag) · [v1.3.2 release notes](https://github.com/darthrater78/smb-diag/releases/tag/v1.3.2)
@@ -55,6 +57,12 @@ This tool is **read-only and diagnostic**. It does not store, transmit, or log a
 |---|---|---|---|---|
 | **AD Joined** | DomainJoined=YES | Direct KDC contact | Hash cached (normal) | Checked (absence is normal) |
 | **Entra Joined** | AzureAdJoined=YES, CloudTgt, OnPremTgt, PRT | Cloud Kerberos Trust | Hash absent (expected) | Skipped |
+
+![Results for an Entra-joined device using Cloud Kerberos Trust](docs/screenshots/results-entra.png)
+
+On an Entra-joined device, the **Kerberos Tickets** tab shows the Primary Refresh Token above the ticket cache:
+
+![Kerberos Tickets tab with PRT status and cached tickets](docs/screenshots/kerberos-tickets.png)
 
 ## Test Groups
 
@@ -182,6 +190,8 @@ dotnet publish -c Release -r win-x64 --self-contained true
 ```
 
 Output: `bin/Release/net8.0-windows/win-x64/publish/smb-diag.exe`
+
+The README screenshots are generated from mock data by `tools/screenshots/run.sh` (Linux, under Wine). See [tools/screenshots/README.md](tools/screenshots/README.md).
 
 ## Version History
 
