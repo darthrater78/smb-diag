@@ -1,0 +1,156 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Checks that the tag is on main and that CI passed on this exact commit,
+  # before anything is built or published. Runs on Linux: no Windows needed here.
+  gate:
+    runs-on: ubuntu-latest
+    # The CI wait loop below gives up after 30 minutes; this is the backstop.
+    timeout-minutes: 35
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tag is on default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"; then
+            echo "Tag $GITHUB_REF_NAME is not on $DEFAULT_BRANCH."
+            echo "Releases come from the default branch only."
+            exit 1
+          fi
+
+      - name: Require a passing CI run for this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 1800 ))
+          while true; do
+            runs=$(gh api \
+              "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}&per_page=100" \
+              --jq '.workflow_runs[] | "\(.status) \(.conclusion) \(.html_url)"')
+
+            if [ -z "$runs" ]; then
+              echo "::error::CI has never run for ${SHA}, so nothing has tested this commit."
+              echo "Push the branch so CI runs on it, or dispatch it by hand" >&2
+              echo "(Actions -> CI -> Run workflow), then re-tag." >&2
+              exit 1
+            fi
+
+            if printf '%s\n' "$runs" | awk '$2 == "success" { hit = 1 } END { exit !hit }'; then
+              echo "CI passed for ${SHA}."
+              exit 0
+            fi
+
+            unfinished=$(printf '%s\n' "$runs" | awk '$1 != "completed"' | wc -l)
+            if [ "$unfinished" -eq 0 ]; then
+              echo "::error::CI ran for ${SHA} and did not pass. Refusing to release."
+              printf '%s\n' "$runs" | sed 's/^/  /' >&2
+              exit 1
+            fi
+
+            echo "CI is still running for ${SHA} (${unfinished} unfinished) -- waiting."
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Timed out waiting for CI on ${SHA} to finish."
+              exit 1
+            fi
+            sleep 20
+          done
+
+  release:
+    needs: gate
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tag matches the version in the tagged commit
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' SmbDiag.csproj | head -1)"
+          if [ -z "$version" ]; then
+            echo "::error::No <Version> found in SmbDiag.csproj. Refusing to publish."
+            exit 1
+          fi
+          if [ "v${version}" != "$TAG" ]; then
+            echo "::error::Tag $TAG is on a commit that declares ${version}. Merge the release first, then tag the merged commit."
+            exit 1
+          fi
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build release
+        run: dotnet publish --configuration Release --output ./publish
+
+      - name: Extract release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [ -f CHANGELOG.md ]; then
+            awk -v v="$version" '
+              $0 ~ "^## \\[" v "\\]" { flag = 1; next }
+              flag && /^## \[/ { exit }
+              flag { print }
+            ' CHANGELOG.md > release-notes.md
+          fi
+          if [ ! -s release-notes.md ]; then
+            echo "::error::No CHANGELOG.md section for ${version}. Add one before tagging."
+            exit 1
+          fi
+
+      # Single-file self-contained exe, attached as-is like earlier releases.
+      - name: Create GitHub release with artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            publish/smb-diag.exe \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md
+
+      - name: Verify release has artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          assets="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')"
+          echo "Assets: $assets"
+          if ! printf '%s\n' "$assets" | grep -qxF smb-diag.exe; then
+            echo "::error::Release published without smb-diag.exe attached."
+            exit 1
+          fi

@@ -4,7 +4,7 @@ Standalone Windows diagnostic tool that tests the full SMB/Kerberos authenticati
 
 ## Download
 
-Grab `smb-diag.exe` from the [latest release](https://github.com/darthrater78/smb-diag/releases/latest). No installation — just run.
+Grab `smb-diag.exe` from the [latest release](https://github.com/darthrater78/smb-diag/releases/latest). No installation — just run. Source: [github.com/darthrater78/smb-diag](https://github.com/darthrater78/smb-diag) · [v1.3.2 release notes](https://github.com/darthrater78/smb-diag/releases/tag/v1.3.2)
 
 ## Windows SmartScreen
 
@@ -169,7 +169,7 @@ Tests connectivity to services required for SMB authentication. Port checks run 
 | `tpmtool getdeviceinformation` | TPM detection | 5s |
 | `net use` / `net use /delete` | Share access test | 8s / 3s |
 
-All launched with `CreateNoWindow`, `UseShellExecute=false`, `RedirectStandardOutput/Error`, async stdout+stderr drain, killed on timeout.
+All launched by full System32 path (never searched for by bare name, so a same-named exe next to `smb-diag.exe` cannot run in their place), with `CreateNoWindow`, `UseShellExecute=false`, `RedirectStandardOutput/Error`, async stdout+stderr drain, killed on timeout. `secur32.dll` is loaded from System32 only.
 
 ## Build from Source
 
@@ -187,6 +187,7 @@ Output: `bin/Release/net8.0-windows/win-x64/publish/smb-diag.exe`
 
 | Version | Date | Changes |
 |---|---|---|
+| v1.3.2 | 2026-09-27 | Security hardening from audit: system tools launched by full System32 path (blocks exe planting beside smb-diag.exe), secur32.dll loaded from System32 only, stricter hostname validation (DNS label rules), settings load/save/reset failures reported instead of ignored; CI build, tag-triggered release workflow, workflow linting and Dependabot added |
 | v1.3.1 | 2026-07-16 | Fix crash when clicking Clear/Reset mid-run; fix stale "Pending..." history entries on cancelled runs; fix "running..." indicator turning off too early; fix klist Client field not parsing; fix WHfB duplicate entries on registry access failure; fix Open Share ignoring domain suffix; async Kerberos Tickets tab (no more UI freeze); drain stderr in RunProcess to prevent pipe-buffer deadlock; disable action buttons during diagnostic run to prevent data corruption; reentrancy guard on ticket refresh; extract shared suffix helper |
 | v1.3.0 | 2026-07-12 | DNS SRV Records split into its own test group, now runs for both AD and Entra scenarios (Entra devices with Cloud Kerberos Trust need _kerberos._tcp and _ldap._tcp for on-prem service access); kpasswd SRV skipped for Entra (password changes go through Entra ID); domain suffix checkboxes now on by default with improved readability |
 | v1.2.1 | 2026-07-12 | Added LDAP SRV, Global Catalog SRV, and kpasswd SRV record checks to Kerberos Configuration (AD only); optional checks labeled with guide reference |
