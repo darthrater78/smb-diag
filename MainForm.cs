@@ -19,6 +19,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 #nullable enable
+[assembly: DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
 namespace SmbDiag;
 
 static class Program
@@ -52,7 +53,7 @@ class MainForm : Form
     static readonly Color SkipColor = Color.FromArgb(0x6b, 0x72, 0x80);
     static readonly Color AccentColor = Color.FromArgb(0x60, 0xa5, 0xfa);
     static readonly Color AccentDimColor = Color.FromArgb(0x25, 0x63, 0xeb);
-    static readonly Regex HostnamePattern = new(@"^[a-zA-Z0-9.\-]+$");
+    static readonly Regex HostnamePattern = new(@"^(?!-)[a-zA-Z0-9\-]{1,63}(?<!-)(\.(?!-)[a-zA-Z0-9\-]{1,63}(?<!-))*$");
     static readonly Regex ShareNamePattern = new(@"^[a-zA-Z0-9_\-$.]+$");
     static readonly Pen BorderPen = new(BorderColor);
 
@@ -385,7 +386,10 @@ class MainForm : Form
             if (s.TryGetValue("dcSuffix", out var ds))
                 _chkDcSuffix.Checked = ds.ValueKind == JsonValueKind.True;
         }
-        catch { }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
+        {
+            _lblStatus.Text = $"Saved settings could not be loaded: {ex.Message}";
+        }
     }
 
     async Task DetectScenarioAsync()
@@ -454,7 +458,11 @@ class MainForm : Form
             Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
             File.WriteAllText(SettingsPath, JsonSerializer.Serialize(s, new JsonSerializerOptions { WriteIndented = true }));
         }
-        catch { }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            MessageBox.Show($"Settings could not be saved:\n{ex.Message}", "SMB Diag",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
     }
 
     static void AddToHistory(ComboBox cbo)
@@ -514,8 +522,15 @@ class MainForm : Form
         _txtDc.Items.Clear(); _txtDc.Text = "";
         _txtShare.Items.Clear(); _txtShare.Text = "";
         BtnClear_Click(sender, e);
-        try { if (File.Exists(SettingsPath)) File.Delete(SettingsPath); } catch { }
-        _lblStatus.Text = "All settings reset";
+        try
+        {
+            if (File.Exists(SettingsPath)) File.Delete(SettingsPath);
+            _lblStatus.Text = "All settings reset";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _lblStatus.Text = $"Reset, but saved settings could not be deleted: {ex.Message}";
+        }
     }
 
     void BtnOpenShare_Click(object? sender, EventArgs e)
@@ -2664,7 +2679,7 @@ class MainForm : Form
     {
         var psi = new ProcessStartInfo
         {
-            FileName = fileName, Arguments = arguments,
+            FileName = ResolveSystemTool(fileName), Arguments = arguments,
             UseShellExecute = false, RedirectStandardOutput = true,
             RedirectStandardError = true, CreateNoWindow = true,
             StandardOutputEncoding = Encoding.UTF8,
@@ -2679,6 +2694,19 @@ class MainForm : Form
         }
         Task.WaitAll(outputTask, errorTask);
         return outputTask.GetAwaiter().GetResult();
+    }
+
+    // Bare names would be searched in the exe's folder and the current directory
+    // before System32, so a planted klist.exe next to smb-diag.exe would run instead.
+    static string ResolveSystemTool(string name)
+    {
+        string sys = Environment.SystemDirectory;
+        string path = name == "powershell"
+            ? Path.Combine(sys, "WindowsPowerShell", "v1.0", "powershell.exe")
+            : Path.Combine(sys, name + ".exe");
+        if (!File.Exists(path))
+            throw new FileNotFoundException($"{name} not found in {sys}", path);
+        return path;
     }
 
     static TestEntry DetectTpm()

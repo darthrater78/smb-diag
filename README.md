@@ -169,7 +169,7 @@ Tests connectivity to services required for SMB authentication. Port checks run 
 | `tpmtool getdeviceinformation` | TPM detection | 5s |
 | `net use` / `net use /delete` | Share access test | 8s / 3s |
 
-All launched with `CreateNoWindow`, `UseShellExecute=false`, `RedirectStandardOutput/Error`, async stdout+stderr drain, killed on timeout.
+All launched by full System32 path (never searched for by bare name, so a same-named exe next to `smb-diag.exe` cannot run in their place), with `CreateNoWindow`, `UseShellExecute=false`, `RedirectStandardOutput/Error`, async stdout+stderr drain, killed on timeout. `secur32.dll` is loaded from System32 only.
 
 ## Build from Source
 

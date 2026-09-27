@@ -3,3 +3,5 @@ obj/
 *.user
 *.pdb
 smb-diag-settings.json
+.dev-skills-gates.md
+.dev-skills-handoff.md
