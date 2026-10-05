@@ -10,9 +10,11 @@ updates:
         patterns:
           - "*"
 
-  # No PackageReferences today; this watches any that get added
+  # The app has no PackageReferences; the unit tests have the test framework
   - package-ecosystem: "nuget"
-    directory: "/"
+    directories:
+      - "/"
+      - "/tests/SmbDiag.Tests"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10

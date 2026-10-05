@@ -5,8 +5,9 @@ on:
     tags:
       - 'v*'
 
+# Each job asks for what it needs
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -83,6 +84,10 @@ jobs:
     needs: gate
     runs-on: windows-latest
     timeout-minutes: 20
+    permissions:
+      contents: write      # create the GitHub release
+      id-token: write      # sign the build provenance attestation
+      attestations: write  # store the attestation
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -112,6 +117,13 @@ jobs:
 
       - name: Build release
         run: dotnet publish --configuration Release --output ./publish
+
+      # A signed record that this exe was built by this workflow from the tagged commit.
+      # Check a download with: gh attestation verify smb-diag.exe --repo darthrater78/smb-diag
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: publish/smb-diag.exe
 
       - name: Extract release notes
         shell: bash

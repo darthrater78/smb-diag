@@ -1,21 +1,42 @@
 name: CI
 
+# Every branch push builds, so a branch can be tested (and its exe downloaded) before any pull request exists.
+# pull_request is kept for forks only, whose pushes don't run here; same-repo PRs are covered by the push run.
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # A docs-only change (Markdown, docs/, screenshots) has nothing to build or test
+  changes:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: diff
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash scripts/ci-changes.sh "$BASE" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: changes
+    # Runs unless the change is known to be docs-only; if the changes job itself fails, build anyway
+    if: ${{ !cancelled() && needs.changes.result != 'skipped' && needs.changes.outputs.code != 'false' }}
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -23,20 +44,30 @@ jobs:
         with:
           persist-credentials: false
 
+      # The app targets .NET 8; the unit tests target .NET 10 (see tests/SmbDiag.Tests/SmbDiag.Tests.csproj)
       - name: Setup .NET
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: |
+            8.0.x
+            10.0.x
 
-      - name: Restore dependencies
-        run: dotnet restore
+      - name: Build
+        run: dotnet build SmbDiag.csproj -c Release -warnaserror
 
-      # Publish rather than build: the csproj's single-file/self-contained settings
+      - name: Test
+        run: dotnet test tests/SmbDiag.Tests -c Release -warnaserror
+
+      # The screenshot harness compiles the app's own MainForm; it only runs on Linux, but it must keep building
+      - name: Build screenshot harness
+        run: dotnet build tools/screenshots/Shots.csproj -c Release -warnaserror
+
+      # Publish as well as build: the csproj's single-file/self-contained settings
       # only take effect on publish, and that exe is what ships.
       - name: Publish
-        run: dotnet publish --configuration Release --no-restore --output ./publish
+        run: dotnet publish SmbDiag.csproj --configuration Release --output ./publish
 
-      # Test artifact from this exact commit, for verifying a PR before merge.
+      # Test artifact from this exact commit, for verifying a branch before merge.
       - name: Upload test build
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

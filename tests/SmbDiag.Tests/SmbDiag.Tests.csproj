@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Targets .NET 10 while the app is still on .NET 8: these run on Linux as well as in CI, and the code
+       under test has no Windows dependency. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>SmbDiag.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <!-- Compile the app's runner and log directly: the app itself is WinForms and can't load off Windows. -->
+  <ItemGroup>
+    <Compile Include="../../Runner.cs" Link="Runner.cs" />
+    <Compile Include="../../Log.cs" Link="Log.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.10.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.0" />
+  </ItemGroup>
+</Project>
