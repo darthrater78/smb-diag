@@ -34,6 +34,8 @@ static class Program
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
+        // Recorded only when logging is on; the crash itself is left to Windows as before
+        AppDomain.CurrentDomain.UnhandledException += (s, e) => Log.Error("unhandled exception", e.ExceptionObject as Exception);
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Application.Run(new MainForm());
@@ -75,6 +77,7 @@ class MainForm : Form
     int _scenarioIndex;
     readonly Button _btnRun, _btnExport, _btnClear, _btnReset, _btnOpenShare, _btnTabResults, _btnTabGuide, _btnTabTickets, _btnPurgeTickets;
     readonly Label _lblStatus, _lblPassCount, _lblFailCount, _lblWarnCount;
+    readonly LinkLabel _lnkLog;
     readonly Panel _summaryPanel, _resultsCanvas, _resultsScrollPanel, _historyPanel, _ticketsPanel;
     readonly RichTextBox _guideBox, _ticketsBox;
     List<TestGroup>? _lastResults;
@@ -95,7 +98,7 @@ class MainForm : Form
     {
         Text = "SMB Auth Diagnostics";
         Size = new Size(820, 900);
-        MinimumSize = new Size(600, 500);
+        MinimumSize = new Size(660, 500);
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = BgColor;
         ForeColor = TextColor;
@@ -126,7 +129,7 @@ class MainForm : Form
         var header = new Panel { Height = 34, Dock = DockStyle.Fill };
         header.Paint += (s, e) => e.Graphics.DrawLine(BorderPen, 0, header.Height - 1, header.Width, header.Height - 1);
         var lblTitle = new Label { Text = "SMB Auth Diagnostics", ForeColor = TextColor, Font = new Font("Segoe UI", 11f, FontStyle.Bold), AutoSize = true, Location = new Point(10, 6) };
-        var lblTag = new Label { Text = " v1.3.2 ", ForeColor = AccentColor, BackColor = AccentDimColor, Font = new Font("Segoe UI", 7.5f, FontStyle.Bold), AutoSize = true, Location = new Point(192, 10) };
+        var lblTag = new Label { Text = " v1.4.0 ", ForeColor = AccentColor, BackColor = AccentDimColor, Font = new Font("Segoe UI", 7.5f, FontStyle.Bold), AutoSize = true, Location = new Point(192, 10) };
         _btnAD = new Button
         {
             Text = "AD Joined", FlatStyle = FlatStyle.Flat,
@@ -150,13 +153,19 @@ class MainForm : Form
         var lnkGithub = new LinkLabel { Text = "GitHub", Font = new Font("Segoe UI", 8f), AutoSize = true, LinkColor = AccentColor, ActiveLinkColor = AccentColor, VisitedLinkColor = AccentColor, Anchor = AnchorStyles.Top | AnchorStyles.Right };
         lnkGithub.LinkClicked += (s, e) => Process.Start(new ProcessStartInfo { FileName = "https://github.com/darthrater78/smb-diag", UseShellExecute = true });
         var lnkRelease = new LinkLabel { Text = "Release Notes", Font = new Font("Segoe UI", 8f), AutoSize = true, LinkColor = AccentColor, ActiveLinkColor = AccentColor, VisitedLinkColor = AccentColor, Anchor = AnchorStyles.Top | AnchorStyles.Right };
-        lnkRelease.LinkClicked += (s, e) => Process.Start(new ProcessStartInfo { FileName = "https://github.com/darthrater78/smb-diag/releases/tag/v1.3.2", UseShellExecute = true });
-        header.Controls.AddRange([lblTitle, lblTag, _btnAD, _btnEntra, lnkGithub, lnkRelease]);
-        header.Resize += (s, e) =>
+        lnkRelease.LinkClicked += (s, e) => Process.Start(new ProcessStartInfo { FileName = "https://github.com/darthrater78/smb-diag/releases/tag/v1.4.0", UseShellExecute = true });
+        var lnkLog = _lnkLog = new LinkLabel { Font = new Font("Segoe UI", 8f), AutoSize = true, LinkColor = AccentColor, ActiveLinkColor = AccentColor, VisitedLinkColor = AccentColor, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+        _lnkLog.LinkClicked += (s, e) => ShowLogMenu();
+        void PlaceHeaderLinks()
         {
             lnkRelease.Location = new Point(header.ClientSize.Width - lnkRelease.Width - 10, 10);
             lnkGithub.Location = new Point(lnkRelease.Left - lnkGithub.Width - 12, 10);
-        };
+            lnkLog.Location = new Point(lnkGithub.Left - lnkLog.Width - 12, 10);
+        }
+        _lnkLog.SizeChanged += (s, e) => PlaceHeaderLinks();
+        header.Controls.AddRange([lblTitle, lblTag, _btnAD, _btnEntra, _lnkLog, lnkGithub, lnkRelease]);
+        header.Resize += (s, e) => PlaceHeaderLinks();
+        UpdateLogLink();
         layout.Controls.Add(header, 0, 0);
 
         // Config
@@ -319,7 +328,14 @@ class MainForm : Form
             _runCts?.Cancel();
             SaveSettings();
         };
-        FormClosed += (s, e) => Environment.Exit(0);
+        FormClosed += (s, e) =>
+        {
+            KillChildProcesses();
+            // Not Environment.Exit: that runs the runtime's orderly shutdown, which can wait on worker threads
+            // still inside a Windows call and leave smb-diag.exe running with no window. Settings are already
+            // saved and nothing else needs flushing, so end the process outright.
+            TerminateProcess(GetCurrentProcess(), 0);
+        };
         _ = DetectScenarioAsync();
     }
 
@@ -385,11 +401,96 @@ class MainForm : Form
                 _chkServerSuffix.Checked = ss.ValueKind == JsonValueKind.True;
             if (s.TryGetValue("dcSuffix", out var ds))
                 _chkDcSuffix.Checked = ds.ValueKind == JsonValueKind.True;
+            if (s.TryGetValue("logging", out var lg) && lg.ValueKind == JsonValueKind.String)
+                SetLogLevel(lg.GetString() switch { "on" => LogLevel.Normal, "debug" => LogLevel.Debug, _ => LogLevel.Off });
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
         {
             _lblStatus.Text = $"Saved settings could not be loaded: {ex.Message}";
         }
+    }
+
+    // ── Logging ─────────────────────────────────────────────
+
+    static string LogLevelName(LogLevel level) => level switch { LogLevel.Normal => "on", LogLevel.Debug => "debug", _ => "off" };
+
+    void UpdateLogLink() => _lnkLog.Text = $"Log: {LogLevelName(Log.Level)}";
+
+    void SetLogLevel(LogLevel level)
+    {
+        if (level == Log.Level) return;
+        bool wasOff = Log.Level == LogLevel.Off;
+        if (level == LogLevel.Off) Log.Info("logging turned off");
+        Log.Level = level;
+        if (wasOff)
+        {
+            bool elevated = false;
+            try { elevated = new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator); } catch { }
+            Log.Info($"smb-diag {Application.ProductVersion} on {Environment.OSVersion.VersionString}, elevated: {elevated}, logging: {LogLevelName(level)}");
+        }
+        else if (level != LogLevel.Off)
+            Log.Info($"logging: {LogLevelName(level)}");
+        UpdateLogLink();
+    }
+
+    void ShowLogMenu()
+    {
+        var menu = new ContextMenuStrip();
+        void AddLevel(string text, LogLevel level)
+        {
+            var item = new ToolStripMenuItem(text) { Checked = Log.Level == level };
+            item.Click += (s, e) =>
+            {
+                SetLogLevel(level);
+                SaveSettings();
+                _lblStatus.ForeColor = DimColor;
+                _lblStatus.Text = level == LogLevel.Off ? "Logging off" : "Logging on, kept in memory until you save it";
+            };
+            menu.Items.Add(item);
+        }
+        AddLevel("Off", LogLevel.Off);
+        AddLevel("On: runs, results and errors", LogLevel.Normal);
+        AddLevel("Debug: also every tool's command and raw output", LogLevel.Debug);
+        menu.Items.Add(new ToolStripSeparator());
+        var save = new ToolStripMenuItem("Save log...") { Enabled = !Log.IsEmpty };
+        save.Click += (s, e) => SaveLog();
+        var clear = new ToolStripMenuItem("Clear log") { Enabled = !Log.IsEmpty };
+        clear.Click += (s, e) =>
+        {
+            Log.Clear();
+            _lblStatus.ForeColor = DimColor;
+            _lblStatus.Text = "Log cleared";
+        };
+        menu.Items.AddRange([save, clear]);
+        menu.Closed += (s, e) => BeginInvoke(menu.Dispose);
+        menu.Show(_lnkLog, new Point(0, _lnkLog.Height));
+    }
+
+    // The log lives in memory only; this is the one way it reaches disk, and only where the user says
+    void SaveLog()
+    {
+        using var dlg = new SaveFileDialog
+        {
+            Filter = "Log files (*.log)|*.log|Text files (*.txt)|*.txt",
+            FileName = $"smb-diag-{DateTime.Now:yyyyMMdd-HHmmss}.log",
+        };
+        if (dlg.ShowDialog() != DialogResult.OK) return;
+        _lblStatus.ForeColor = DimColor;
+        try
+        {
+            File.WriteAllText(dlg.FileName, Log.Snapshot(), Encoding.UTF8);
+            _lblStatus.Text = $"Log saved to {dlg.FileName}";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _lblStatus.Text = $"Log could not be saved: {ex.Message}";
+        }
+    }
+
+    static void LogGroup(TestGroup group)
+    {
+        if (Log.Level == LogLevel.Off) return;
+        Log.Info(group.Name + "\n" + string.Join("\n", group.Tests.Select(t => $"{t.Status.ToString().ToUpperInvariant(),-4} {t.Name}: {t.Detail}")));
     }
 
     async Task DetectScenarioAsync()
@@ -454,6 +555,7 @@ class MainForm : Form
                 ["scenario"] = _scenarioIndex,
                 ["serverSuffix"] = _chkServerSuffix.Checked,
                 ["dcSuffix"] = _chkDcSuffix.Checked,
+                ["logging"] = LogLevelName(Log.Level),
             };
             Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
             File.WriteAllText(SettingsPath, JsonSerializer.Serialize(s, new JsonSerializerOptions { WriteIndented = true }));
@@ -513,7 +615,7 @@ class MainForm : Form
     void BtnReset_Click(object? sender, EventArgs e)
     {
         var result = MessageBox.Show(
-            "This will clear all saved server history, input fields, results, and settings.\n\nContinue?",
+            "This will clear all saved server history, input fields, results, and settings, turn logging off and discard the log.\n\nContinue?",
             "Reset All", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
         if (result != DialogResult.Yes) return;
 
@@ -522,6 +624,8 @@ class MainForm : Form
         _txtDc.Items.Clear(); _txtDc.Text = "";
         _txtShare.Items.Clear(); _txtShare.Text = "";
         BtnClear_Click(sender, e);
+        SetLogLevel(LogLevel.Off);
+        Log.Clear();
         try
         {
             if (File.Exists(SettingsPath)) File.Delete(SettingsPath);
@@ -1428,14 +1532,19 @@ class MainForm : Form
         _selectedRunIndex = 0;
         RebuildHistoryBar();
 
+        var runClock = Stopwatch.StartNew();
+        Log.Info($"run started: {(scenario == Scenario.Entra ? "Entra joined" : "AD joined")}, server {server}, domain {domain}, "
+            + $"DC {(string.IsNullOrEmpty(dc) ? "(none)" : dc)}, share {(string.IsNullOrEmpty(share) ? "(none)" : share)}");
+
         void CancelCleanup()
         {
+            Log.Info($"run cancelled after {runClock.ElapsedMilliseconds} ms");
             if (IsDisposed) return;
             history.Remove(pendingEntry);
             RebuildHistoryBar();
         }
 
-        var config = new DiagConfig(server, domain, dc, share, scenario);
+        var config = new DiagConfig(server, domain, dc, share, scenario, cts.Token);
         int completed = 0;
         int totalGroups = results.Count;
 
@@ -1444,18 +1553,24 @@ class MainForm : Form
             if (cts.IsCancellationRequested || IsDisposed) { CancelCleanup(); return; }
             int idx = results.FindIndex(g => g.Name == name);
             if (idx >= 0) results[idx] = result;
+            LogGroup(result);
             completed++;
             _lblStatus.Text = $"Running diagnostics... ({completed}/{totalGroups})";
             RenderResults(results, running: true);
         }
 
-        var identityTask = Task.Run(() => TestDeviceIdentity(config));
-        var kerbTask = Task.Run(() => TestKerberosTickets(config));
-        var sspiTask = Task.Run(() => TestSspiNegotiation(config));
-        var netTask = Task.Run(() => TestNetworkPath(config));
-        var smbTask = Task.Run(() => TestSmbConfig(config));
-        var shareTask = Task.Run(() => TestShareAccess(config));
-        var credTask = Task.Run(() => TestCredentialStore(config));
+        // Each group blocks on external tools and the network for seconds at a time, so it gets its own
+        // thread: on the shared pool they starve the continuations that read the tools' output
+        Task<TestGroup> StartGroup(Func<TestGroup> test) =>
+            Task.Factory.StartNew(test, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+        var identityTask = StartGroup(() => TestDeviceIdentity(config));
+        var kerbTask = StartGroup(() => TestKerberosTickets(config));
+        var sspiTask = StartGroup(() => TestSspiNegotiation(config));
+        var netTask = StartGroup(() => TestNetworkPath(config));
+        var smbTask = StartGroup(() => TestSmbConfig(config));
+        var shareTask = StartGroup(() => TestShareAccess(config));
+        var credTask = StartGroup(() => TestCredentialStore(config));
 
         var pending = new List<(Task task, string name, Func<TestGroup> getResult)>
         {
@@ -1482,12 +1597,12 @@ class MainForm : Form
             var kerbGroup = results.First(g => g.Name == "Kerberos Tickets");
             bool hasCifsTicket = kerbGroup.Tests.Any(t =>
                 t.Name == "cifs/ Service Ticket" && t.Status == Status.Pass);
-            var kerbConfig = await Task.Run(() => TestKerberosConfig(config, hasCifsTicket));
+            var kerbConfig = await StartGroup(() => TestKerberosConfig(config, hasCifsTicket));
             if (cts.IsCancellationRequested || IsDisposed) { CancelCleanup(); return; }
             ReplaceGroup("Kerberos Configuration", kerbConfig);
         }
 
-        var srvResult = await Task.Run(() => TestDnsSrvRecords(config));
+        var srvResult = await StartGroup(() => TestDnsSrvRecords(config));
         if (cts.IsCancellationRequested || IsDisposed) { CancelCleanup(); return; }
         ReplaceGroup("DNS SRV Records", srvResult);
 
@@ -1499,6 +1614,10 @@ class MainForm : Form
         RebuildHistoryBar();
 
         SaveSettings();
+        var all = results.SelectMany(g => g.Tests).ToList();
+        Log.Info($"run complete in {runClock.ElapsedMilliseconds} ms: {all.Count(t => t.Status == Status.Pass)} passed, "
+            + $"{all.Count(t => t.Status == Status.Fail)} failed, {all.Count(t => t.Status == Status.Warn)} warnings, "
+            + $"{all.Count(t => t.Status == Status.Skip)} skipped");
         _lblStatus.Text = "Complete";
         _btnRun.Enabled = true;
         _btnExport.Enabled = true;
@@ -1783,7 +1902,7 @@ class MainForm : Form
 
         try
         {
-            dsreg = RunProcess("dsregcmd", "/status");
+            dsreg = RunProcess("dsregcmd", "/status", ct: cfg.Cancel);
 
             var m = Regex.Match(dsreg, @"DomainJoined\s*:\s*(\S+)");
             bool domJoined = m.Success && m.Groups[1].Value == "YES";
@@ -1864,7 +1983,7 @@ class MainForm : Form
             else
                 tests.Add(new("WHfB Status", Status.Pass, "No NGC enrollment detected"));
 
-            tests.Add(DetectTpm());
+            tests.Add(DetectTpm(cfg.Cancel));
 
             if (ngcSet)
             {
@@ -2017,7 +2136,7 @@ class MainForm : Form
 
         try
         {
-            string klist = RunProcess("klist", "");
+            string klist = RunProcess("klist", "", ct: cfg.Cancel);
 
             var tgtPattern = new Regex(
                 $@"krbtgt/{Regex.Escape(realm)}\s*@\s*{Regex.Escape(realm)}",
@@ -2088,7 +2207,29 @@ class MainForm : Form
         return new("Kerberos Tickets", tests);
     }
 
+    const int SspiTimeoutMs = 20000;
+
+    // InitializeSecurityContext asks the KDC for a service ticket inside Windows, where nothing can cancel it
+    // and an unreachable KDC can hold it for a long time. So it runs under a deadline.
     static TestGroup TestSspiNegotiation(DiagConfig cfg)
+    {
+        try
+        {
+            return Runner.RunWithTimeout(() => NegotiateSspi(cfg), SspiTimeoutMs, "SSPI negotiation", cfg.Cancel);
+        }
+        catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
+        {
+            return new("SSPI / SPNEGO Negotiation",
+            [
+                new("AcquireCredentials", Status.Skip, ex.Message),
+                new("SPNEGO Rounds", Status.Skip, "Not completed"),
+                new("Final Auth Package", Status.Skip, "N/A"),
+                new("Negotiation Result", Status.Fail, $"{ex.Message} - no answer from the KDC for cifs/{cfg.Server}"),
+            ]);
+        }
+    }
+
+    static TestGroup NegotiateSspi(DiagConfig cfg)
     {
         var tests = new List<TestEntry>();
         const int maxTokenSize = 16384;
@@ -2203,7 +2344,7 @@ class MainForm : Form
         IPAddress[]? serverAddrs = null;
         try
         {
-            serverAddrs = Dns.GetHostAddresses(cfg.Server);
+            serverAddrs = Runner.ResolveHost(cfg.Server, cfg.Cancel);
             var ipv4 = serverAddrs.Where(a => a.AddressFamily == AddressFamily.InterNetwork).ToArray();
             serverIp = ipv4.FirstOrDefault() ?? serverAddrs.FirstOrDefault();
             var ips = string.Join(", ", ipv4.Select(a => a.ToString()));
@@ -2216,20 +2357,25 @@ class MainForm : Form
         IPAddress? kdcIp = null;
         if (kdc != cfg.Server)
         {
-            try { kdcIp = Dns.GetHostAddresses(kdc).FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork); }
+            // Prefer IPv4, fall back to IPv6
+            try { kdcIp = Runner.ResolveHost(kdc, cfg.Cancel).OrderBy(a => a.AddressFamily == AddressFamily.InterNetwork ? 0 : 1).FirstOrDefault(); }
             catch { }
         }
         else
             kdcIp = serverIp;
 
-        var portTasks = new List<(string Name, int Port, string Host, Task<bool> Task)>();
-        portTasks.Add(("Port 445 (SMB)", 445, cfg.Server, Task.Run(() => TryTcpConnect(serverIp, cfg.Server, 445))));
-        portTasks.Add(("Port 88 (Kerberos)", 88, kdc, Task.Run(() => TryTcpConnect(kdcIp, kdc, 88))));
-        portTasks.Add(("Port 389 (LDAP)", 389, kdc, Task.Run(() => TryTcpConnect(kdcIp, kdc, 389))));
-        if (!isEntra)
-            portTasks.Add(("Port 464 (kpasswd)", 464, kdc, Task.Run(() => TryTcpConnect(kdcIp, kdc, 464))));
+        // A host that didn't resolve has no port to try
+        Task<bool> Probe(IPAddress? ip, int port) =>
+            ip == null ? Task.FromResult(false) : Runner.TryTcpConnectAsync(ip, port, cfg.Cancel);
 
-        Task.WaitAll(portTasks.Select(p => p.Task).ToArray());
+        var portTasks = new List<(string Name, int Port, string Host, Task<bool> Task)>();
+        portTasks.Add(("Port 445 (SMB)", 445, cfg.Server, Probe(serverIp, 445)));
+        portTasks.Add(("Port 88 (Kerberos)", 88, kdc, Probe(kdcIp, 88)));
+        portTasks.Add(("Port 389 (LDAP)", 389, kdc, Probe(kdcIp, 389)));
+        if (!isEntra)
+            portTasks.Add(("Port 464 (kpasswd)", 464, kdc, Probe(kdcIp, 464)));
+
+        Task.WhenAll(portTasks.Select(p => p.Task)).GetAwaiter().GetResult();
 
         foreach (var (name, port, host, task) in portTasks)
         {
@@ -2250,7 +2396,7 @@ class MainForm : Form
 
         try
         {
-            string w32 = RunProcess("w32tm", $"/stripchart /computer:{kdc} /samples:1 /dataonly", timeoutMs: 5000);
+            string w32 = RunProcess("w32tm", $"/stripchart /computer:{kdc} /samples:1 /dataonly", timeoutMs: 5000, ct: cfg.Cancel);
             var m = Regex.Match(w32, @"([+-]?\d+\.\d+)s");
             if (m.Success)
             {
@@ -2262,11 +2408,12 @@ class MainForm : Form
             else
                 tests.Add(new("Clock Skew", Status.Warn, "Cannot measure (DC unreachable?)"));
         }
+        catch (TimeoutException) { tests.Add(new("Clock Skew", Status.Warn, "Cannot measure (DC unreachable?)")); }
         catch { tests.Add(new("Clock Skew", Status.Warn, "w32tm not available")); }
 
         // DNS server configuration + suffix (single ipconfig call)
         string? ipconfigOutput = null;
-        try { ipconfigOutput = RunProcess("ipconfig", "/all"); } catch { }
+        try { ipconfigOutput = RunProcess("ipconfig", "/all", ct: cfg.Cancel); } catch { }
 
         if (ipconfigOutput != null)
         {
@@ -2287,7 +2434,7 @@ class MainForm : Form
 
         try
         {
-            string ipconfig = ipconfigOutput ?? RunProcess("ipconfig", "/all");
+            string ipconfig = ipconfigOutput ?? RunProcess("ipconfig", "/all", ct: cfg.Cancel);
             var suffixMatch = Regex.Match(ipconfig, @"DNS Suffix Search List[\s.]*:\s*(.+)", RegexOptions.IgnoreCase);
             var connSuffix = Regex.Match(ipconfig, @"Connection-specific DNS Suffix[\s.]*:\s*(\S+)", RegexOptions.IgnoreCase);
             var primarySuffix = Regex.Match(ipconfig, @"Primary Dns Suffix[\s.]*:\s*(\S+)", RegexOptions.IgnoreCase);
@@ -2338,7 +2485,7 @@ class MainForm : Form
         {
             try
             {
-                string ck = RunProcess("cmdkey", "/list");
+                string ck = RunProcess("cmdkey", "/list", ct: cfg.Cancel);
                 bool hasSrv = ck.Contains(cfg.Server, StringComparison.OrdinalIgnoreCase);
                 bool hasDom = ck.Contains(cfg.Domain, StringComparison.OrdinalIgnoreCase)
                            || ck.Contains("Domain:target=*", StringComparison.OrdinalIgnoreCase);
@@ -2425,7 +2572,7 @@ class MainForm : Form
 
         try
         {
-            string spnQuery = RunProcess("setspn", $"-Q cifs/{cfg.Server}", timeoutMs: 5000);
+            string spnQuery = RunProcess("setspn", $"-Q cifs/{cfg.Server}", timeoutMs: 5000, ct: cfg.Cancel);
             bool found = spnQuery.Contains($"cifs/{cfg.Server}", StringComparison.OrdinalIgnoreCase)
                       && !spnQuery.Contains("No such SPN found", StringComparison.OrdinalIgnoreCase);
             if (found)
@@ -2505,20 +2652,20 @@ class MainForm : Form
     {
         var tests = new List<TestEntry>();
 
-        tests.Add(LookupSrv($"_kerberos._tcp.{cfg.Domain}", "DNS SRV Records", required: true));
-        tests.Add(LookupSrv($"_ldap._tcp.{cfg.Domain}", "LDAP SRV", required: true));
-        tests.Add(LookupSrv($"_gc._tcp.{cfg.Domain}", "Global Catalog SRV", required: false));
+        tests.Add(LookupSrv($"_kerberos._tcp.{cfg.Domain}", "DNS SRV Records", required: true, cfg.Cancel));
+        tests.Add(LookupSrv($"_ldap._tcp.{cfg.Domain}", "LDAP SRV", required: true, cfg.Cancel));
+        tests.Add(LookupSrv($"_gc._tcp.{cfg.Domain}", "Global Catalog SRV", required: false, cfg.Cancel));
         if (cfg.Scenario != Scenario.Entra)
-            tests.Add(LookupSrv($"_kpasswd._tcp.{cfg.Domain}", "kpasswd SRV", required: false));
+            tests.Add(LookupSrv($"_kpasswd._tcp.{cfg.Domain}", "kpasswd SRV", required: false, cfg.Cancel));
 
         return new("DNS SRV Records", tests);
     }
 
-    static TestEntry LookupSrv(string record, string testName, bool required)
+    static TestEntry LookupSrv(string record, string testName, bool required, CancellationToken ct)
     {
         try
         {
-            string output = RunProcess("nslookup", $"-type=SRV {record}", timeoutMs: 5000);
+            string output = RunProcess("nslookup", $"-type=SRV {record}", timeoutMs: 5000, ct: ct);
             bool found = output.Contains("service", StringComparison.OrdinalIgnoreCase)
                       && output.Contains(record.Split('.', 3)[2], StringComparison.OrdinalIgnoreCase);
             if (found)
@@ -2529,6 +2676,11 @@ class MainForm : Form
             }
             return new(testName, required ? Status.Fail : Status.Warn,
                 $"No {record} record" + (required ? "" : " (optional — see guide)"));
+        }
+        catch (TimeoutException)
+        {
+            return new(testName, required ? Status.Fail : Status.Warn,
+                $"No answer for {record} (DNS query timed out)" + (required ? "" : " (optional — see guide)"));
         }
         catch
         {
@@ -2649,11 +2801,11 @@ class MainForm : Form
             try
             {
                 string uncPath = $@"\\{cfg.Server}\{cfg.Share}";
-                string net = RunProcess("net", $"use \"{uncPath}\" /persistent:no", timeoutMs: 8000);
+                string net = RunProcess("net", $"use \"{uncPath}\" /persistent:no", timeoutMs: 8000, ct: cfg.Cancel);
                 bool ok = net.Contains("successfully", StringComparison.OrdinalIgnoreCase);
                 if (ok)
                 {
-                    RunProcess("net", $"use \"{uncPath}\" /delete /yes", timeoutMs: 3000);
+                    RunProcess("net", $"use \"{uncPath}\" /delete /yes", timeoutMs: 3000, ct: cfg.Cancel);
                     tests.Add(new("Share Access Test", Status.Pass, $"Connected to {uncPath}"));
                 }
                 else
@@ -2675,26 +2827,83 @@ class MainForm : Form
 
     // ── Helpers ─────────────────────────────────────────────
 
-    static string RunProcess(string fileName, string arguments, int timeoutMs = 15000)
+    /// <summary>
+    /// Runs a System32 tool and returns its stdout (or stderr if stdout is empty). Throws <see cref="TimeoutException"/>
+    /// on timeout; cancelling <paramref name="ct"/> kills the tool and throws <see cref="OperationCanceledException"/>.
+    /// </summary>
+    static string RunProcess(string fileName, string arguments, int timeoutMs = 15000, CancellationToken ct = default) =>
+        Runner.RunProcess(ResolveSystemTool(fileName), arguments, timeoutMs, ct, Encoding.UTF8,
+            proc => { if (ChildJob != IntPtr.Zero) AssignProcessToJobObject(ChildJob, proc.Handle); });
+
+    // Every tool the app starts is put in this job, which Windows empties when the app's handle to it closes.
+    // So no tool outlives the app, whether it exits normally, crashes or is ended from Task Manager.
+    static readonly IntPtr ChildJob = CreateChildJob();
+
+    const int JobObjectExtendedLimitInformationClass = 9;
+    const uint JobObjectLimitKillOnJobClose = 0x2000;
+
+    static IntPtr CreateChildJob()
     {
-        var psi = new ProcessStartInfo
+        try
         {
-            FileName = ResolveSystemTool(fileName), Arguments = arguments,
-            UseShellExecute = false, RedirectStandardOutput = true,
-            RedirectStandardError = true, CreateNoWindow = true,
-            StandardOutputEncoding = Encoding.UTF8,
-        };
-        using var proc = Process.Start(psi)
-            ?? throw new InvalidOperationException($"Failed to start {fileName}");
-        var outputTask = proc.StandardOutput.ReadToEndAsync();
-        var errorTask = proc.StandardError.ReadToEndAsync();
-        if (!proc.WaitForExit(timeoutMs))
-        {
-            try { proc.Kill(true); } catch { }
+            IntPtr job = CreateJobObjectW(IntPtr.Zero, null);
+            if (job == IntPtr.Zero) return IntPtr.Zero;
+            var info = new JobObjectExtendedLimitInformation();
+            info.BasicLimitInformation.LimitFlags = JobObjectLimitKillOnJobClose;
+            SetInformationJobObject(job, JobObjectExtendedLimitInformationClass, ref info, Marshal.SizeOf<JobObjectExtendedLimitInformation>());
+            return job;
         }
-        Task.WaitAll(outputTask, errorTask);
-        return outputTask.GetAwaiter().GetResult();
+        catch { return IntPtr.Zero; }
     }
+
+    static void KillChildProcesses()
+    {
+        if (ChildJob != IntPtr.Zero) TerminateJobObject(ChildJob, 1);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct JobObjectBasicLimitInformation
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct JobObjectExtendedLimitInformation
+    {
+        public JobObjectBasicLimitInformation BasicLimitInformation;
+        public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount; // IO_COUNTERS
+        public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr CreateJobObjectW(IntPtr jobAttributes, string? name);
+
+    [DllImport("kernel32.dll")]
+    static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JobObjectExtendedLimitInformation info, int length);
+
+    [DllImport("kernel32.dll")]
+    static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    [DllImport("kernel32.dll")]
+    static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll")]
+    static extern bool TerminateProcess(IntPtr process, uint exitCode);
 
     // Bare names would be searched in the exe's folder and the current directory
     // before System32, so a planted klist.exe next to smb-diag.exe would run instead.
@@ -2709,7 +2918,7 @@ class MainForm : Form
         return path;
     }
 
-    static TestEntry DetectTpm()
+    static TestEntry DetectTpm(CancellationToken ct)
     {
         var parts = new List<string>();
 
@@ -2725,7 +2934,7 @@ class MainForm : Form
         // Method 1: tpmtool (works without elevation on Win10+)
         try
         {
-            string tpmtool = RunProcess("tpmtool", "getdeviceinformation", timeoutMs: 5000);
+            string tpmtool = RunProcess("tpmtool", "getdeviceinformation", timeoutMs: 5000, ct: ct);
             if (tpmtool.Contains("not found", StringComparison.OrdinalIgnoreCase)
                 || tpmtool.Contains("not supported", StringComparison.OrdinalIgnoreCase))
             {
@@ -2769,7 +2978,7 @@ class MainForm : Form
         try
         {
             string tpmInfo = RunProcess("powershell",
-                "-NoProfile -Command \"Get-Tpm | Select-Object -Property TpmPresent,TpmReady,TpmEnabled,ManufacturerVersion | Format-List\"");
+                "-NoProfile -Command \"Get-Tpm | Select-Object -Property TpmPresent,TpmReady,TpmEnabled,ManufacturerVersion | Format-List\"", ct: ct);
             var tpmPresent = Regex.Match(tpmInfo, @"TpmPresent\s*:\s*(\S+)");
             var tpmReady = Regex.Match(tpmInfo, @"TpmReady\s*:\s*(\S+)");
             var tpmEnabled = Regex.Match(tpmInfo, @"TpmEnabled\s*:\s*(\S+)");
@@ -2811,17 +3020,6 @@ class MainForm : Form
             "TPM not detected - WHfB requires TPM for key storage");
     }
 
-    static bool TryTcpConnect(IPAddress? ip, string host, int port, int timeoutMs = 3000)
-    {
-        try
-        {
-            using var client = new TcpClient();
-            var task = ip != null ? client.ConnectAsync(ip, port) : client.ConnectAsync(host, port);
-            return task.Wait(timeoutMs) && client.Connected;
-        }
-        catch { return false; }
-    }
-
     static string? ReadRegistryString(string fullPath, string valueName)
     {
         try
@@ -2857,7 +3055,7 @@ class MainForm : Form
 // ── Data types ──────────────────────────────────────────
 
 enum Scenario { AD, Entra }
-record DiagConfig(string Server, string Domain, string Dc, string Share, Scenario Scenario);
+record DiagConfig(string Server, string Domain, string Dc, string Share, Scenario Scenario, CancellationToken Cancel);
 enum Status { Pass, Fail, Warn, Skip }
 record TestEntry(string Name, Status Status = Status.Skip, string Detail = "");
 record TestGroup(string Name, List<TestEntry> Tests);

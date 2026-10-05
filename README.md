@@ -6,7 +6,7 @@ Standalone Windows diagnostic tool that tests the full SMB/Kerberos authenticati
 
 ## Download
 
-Grab `smb-diag.exe` from the [latest release](https://github.com/darthrater78/smb-diag/releases/latest). No installation — just run. Source: [github.com/darthrater78/smb-diag](https://github.com/darthrater78/smb-diag) · [v1.3.2 release notes](https://github.com/darthrater78/smb-diag/releases/tag/v1.3.2)
+Grab `smb-diag.exe` from the [latest release](https://github.com/darthrater78/smb-diag/releases/latest). No installation — just run. Source: [github.com/darthrater78/smb-diag](https://github.com/darthrater78/smb-diag) · [v1.4.0 release notes](https://github.com/darthrater78/smb-diag/releases/tag/v1.4.0)
 
 ## Windows SmartScreen
 
@@ -30,19 +30,30 @@ Input fields remember previously entered values in a dropdown. Up to 5 diagnosti
 - **Reset** — clears everything including input fields and deletes the settings file
 - **Export Results** — saves a timestamped text report via Save dialog
 
+### Logging
+
+Logging is **off by default**, and the log is **kept in memory only**: the app never writes it to disk by itself. The **Log** link in the header switches the level, and the level is remembered:
+
+- **Off** — nothing is recorded.
+- **On** — each run's targets, every test result, timeouts, cancellations and errors.
+- **Debug** — everything in On, plus the command line, exit code, duration and raw output of every tool the app runs, and each DNS lookup and port probe.
+
+**Save log...** in the same menu writes the log to a file you choose; **Clear log** empties it. Closing the app discards whatever was not saved. The log holds at most about 8 million characters (the oldest entries are dropped first) and a single entry is cut at 64K characters. **Reset** turns logging off and discards the log.
+
 ## Security
 
 ### No credentials are stored or transmitted
 
-This tool is **read-only and diagnostic**. It does not store, transmit, or log any credentials, tokens, or secrets.
+This tool is **read-only and diagnostic**. It does not store, transmit, or log any credentials, tokens, or secrets. The optional log (off by default, see [Logging](#logging)) stays in memory unless you save it.
 
 - **SSPI token buffers are zeroed before freeing.** The Negotiate and NTLM token buffers allocated via `Marshal.AllocHGlobal` are explicitly cleared (`Span<byte>.Clear()`) before being freed, preventing auth tokens from lingering in heap memory.
 - **No credentials are written to disk.** The settings file (`%LOCALAPPDATA%\smb-diag\settings.json`) contains only input field history (hostnames) and scenario selection — never credentials, tokens, or ticket data.
 - **Exported reports contain only metadata.** The text export includes test names and diagnostic details (ticket names, expiry times, encryption types, port status). No raw tokens, password hashes, or credential material is included.
-- **External process output is not persisted.** Output from `dsregcmd`, `klist`, `cmdkey`, and other tools is parsed in memory for specific values only. The raw output is never written to disk or stored beyond the method scope.
+- **External process output is not persisted.** Output from `dsregcmd`, `klist`, `cmdkey`, and other tools is parsed in memory for specific values only. The raw output is never written to disk by the app. With Debug logging on it is also held in the in-memory log, and reaches disk only if you choose **Save log...**.
+- **A saved Debug log holds raw tool output.** That means device and tenant IDs, account names, Kerberos ticket listings (names, times and encryption types, never keys) and the names of stored Credential Manager entries (never their passwords). SSPI tokens are never logged. Treat a saved log as you would an exported report before sharing it.
 - **`net use` connections are immediately cleaned up.** The Share Access Test creates a temporary connection and deletes it (`net use /delete`) immediately after the test.
 - **SSPI contexts are properly released.** `DeleteSecurityContext` and `FreeCredentialsHandle` are called in `finally` blocks to ensure native security handles are not leaked.
-- **`cmdkey /list` output is only string-searched.** The Credential Manager test checks for the presence of server/domain entries — the raw credential list is never stored or exported.
+- **`cmdkey /list` output is only string-searched.** The Credential Manager test checks for the presence of server/domain entries — the raw credential list is never stored or exported by the app (a Debug log you save yourself includes it).
 
 ### Process isolation
 
@@ -157,7 +168,7 @@ Tests connectivity to services required for SMB authentication. Port checks run 
 **SSPI Interop:** Direct `secur32.dll` P/Invoke. All native memory (`Marshal.AllocHGlobal`) tracked before try blocks, zeroed, and freed in `finally` blocks.
 
 **Input Validation:**
-- `HostnamePattern`: `^[a-zA-Z0-9.\-]+$` — server, domain, DC fields
+- `HostnamePattern`: DNS label rules (letters, digits and `-`, 1–63 characters per label, no leading or trailing `-`, no empty labels) — server, domain, DC fields
 - `ShareNamePattern`: `^[a-zA-Z0-9_\-$.]+$` — share name field
 
 **Settings:** `%LOCALAPPDATA%\smb-diag\settings.json`. Contains input history and UI state only — no credentials. Persists across exe updates.
@@ -177,7 +188,9 @@ Tests connectivity to services required for SMB authentication. Port checks run 
 | `tpmtool getdeviceinformation` | TPM detection | 5s |
 | `net use` / `net use /delete` | Share access test | 8s / 3s |
 
-All launched by full System32 path (never searched for by bare name, so a same-named exe next to `smb-diag.exe` cannot run in their place), with `CreateNoWindow`, `UseShellExecute=false`, `RedirectStandardOutput/Error`, async stdout+stderr drain, killed on timeout. `secur32.dll` is loaded from System32 only.
+All launched by full System32 path (never searched for by bare name, so a same-named exe next to `smb-diag.exe` cannot run in their place), with `CreateNoWindow`, `UseShellExecute=false`, `RedirectStandardOutput/Error`, async stdout+stderr drain, killed on timeout. Standard input is closed at once, so a tool that prompts gets end-of-file instead of waiting. `secur32.dll` is loaded from System32 only.
+
+**Deadlines and shutdown:** nothing the app waits on is unbounded. DNS lookups give up after 8s, port probes after 3s, the SSPI negotiation after 20s, and reading a tool's output after 3s beyond its exit. Every tool is placed in a Windows job object that is emptied when the app's handle closes, so none outlives the app even if it crashes or is ended from Task Manager. Closing the window cancels the run, stops its tools, saves settings and ends the process at once.
 
 ## Build from Source
 
@@ -191,12 +204,15 @@ dotnet publish -c Release -r win-x64 --self-contained true
 
 Output: `bin/Release/net8.0-windows/win-x64/publish/smb-diag.exe`
 
+Unit tests for the process runner and the log (`tests/SmbDiag.Tests`, .NET 10 SDK) run anywhere: `dotnet test tests/SmbDiag.Tests`.
+
 The README screenshots are generated from mock data by `tools/screenshots/run.sh` (Linux, under Wine). See [tools/screenshots/README.md](tools/screenshots/README.md).
 
 ## Version History
 
 | Version | Date | Changes |
 |---|---|---|
+| v1.4.0 | 2026-10-05 | Optional logging (Off / On / Debug), kept in memory and saved only on request; the app now always exits when closed and never leaves tools running: every tool runs in a kill-on-close job, DNS, port probes and SSPI negotiation have deadlines, closing cancels the run; tool errors written to stderr are now shown; unit tests and docs-only CI skip added |
 | v1.3.2 | 2026-09-27 | Security hardening from audit: system tools launched by full System32 path (blocks exe planting beside smb-diag.exe), secur32.dll loaded from System32 only, stricter hostname validation (DNS label rules), settings load/save/reset failures reported instead of ignored; CI build, tag-triggered release workflow, workflow linting and Dependabot added |
 | v1.3.1 | 2026-07-16 | Fix crash when clicking Clear/Reset mid-run; fix stale "Pending..." history entries on cancelled runs; fix "running..." indicator turning off too early; fix klist Client field not parsing; fix WHfB duplicate entries on registry access failure; fix Open Share ignoring domain suffix; async Kerberos Tickets tab (no more UI freeze); drain stderr in RunProcess to prevent pipe-buffer deadlock; disable action buttons during diagnostic run to prevent data corruption; reentrancy guard on ticket refresh; extract shared suffix helper |
 | v1.3.0 | 2026-07-12 | DNS SRV Records split into its own test group, now runs for both AD and Entra scenarios (Entra devices with Cloud Kerberos Trust need _kerberos._tcp and _ldap._tcp for on-prem service access); kpasswd SRV skipped for Entra (password changes go through Entra ID); domain suffix checkboxes now on by default with improved readability |
