@@ -40,7 +40,7 @@ static class Runner
             StandardOutputEncoding = outputEncoding,
             StandardErrorEncoding = outputEncoding,
         };
-        Log.Debug($"run: {name} {arguments}");
+        AppLog.Debug("tool", $"{name} {arguments}".Trim() + " started");
         var clock = Stopwatch.StartNew();
         using var proc = Process.Start(psi)
             ?? throw new InvalidOperationException($"Failed to start {name}");
@@ -59,18 +59,18 @@ static class Runner
         if (!finished)
         {
             try { proc.Kill(true); } catch { }
-            if (ct.IsCancellationRequested) Log.Debug($"cancelled: {name} after {clock.ElapsedMilliseconds} ms");
+            if (ct.IsCancellationRequested) AppLog.Debug("tool", $"{name} cancelled after {clock.ElapsedMilliseconds} ms");
             ct.ThrowIfCancellationRequested();
-            Log.Info($"timed out: {name} {arguments} after {timeoutMs / 1000}s");
+            AppLog.Info("tool", $"{name} {arguments}".Trim() + $" timed out after {timeoutMs / 1000}s");
             throw new TimeoutException($"{name} timed out after {timeoutMs / 1000}s");
         }
         ct.ThrowIfCancellationRequested();
 
         string stdout = stdoutTask.GetAwaiter().GetResult();
         string stderr = stderrTask.GetAwaiter().GetResult();
-        if (Log.DebugEnabled)
-            Log.Debug($"exit {proc.ExitCode}: {name} in {clock.ElapsedMilliseconds} ms\n{stdout}"
-                + (string.IsNullOrWhiteSpace(stderr) ? "" : $"\n[stderr]\n{stderr}"));
+        int exitCode = proc.ExitCode;
+        AppLog.Debug("tool", () => $"{name} {arguments}".Trim() + $" exited {exitCode} ({clock.ElapsedMilliseconds} ms)\n{stdout}"
+            + (string.IsNullOrWhiteSpace(stderr) ? "" : $"\n[stderr]\n{stderr}"));
         if (string.IsNullOrWhiteSpace(stdout) && !string.IsNullOrWhiteSpace(stderr))
             return stderr;
         return stdout;
@@ -95,7 +95,7 @@ static class Runner
         {
             if (!done.Task.Wait(timeoutMs, ct))
             {
-                Log.Info($"timed out: {what} after {timeoutMs / 1000}s");
+                AppLog.Info("call", $"{what} timed out after {timeoutMs / 1000}s");
                 throw new TimeoutException($"{what} timed out after {timeoutMs / 1000}s");
             }
         }
@@ -116,17 +116,17 @@ static class Runner
             var addrs = Dns.GetHostAddressesAsync(host, deadline.Token).WaitAsync(deadline.Token).GetAwaiter().GetResult()
                 .Where(a => a.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6)
                 .ToArray();
-            Log.Debug($"resolve: {host} -> {(addrs.Length == 0 ? "no addresses" : string.Join(", ", addrs.Select(a => a.ToString())))}");
+            AppLog.Debug("dns", () => $"Resolve {host}: {(addrs.Length == 0 ? "(none)" : string.Join(", ", addrs.Select(a => a.ToString())))}");
             return addrs;
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            Log.Info($"timed out: resolving {host} after {timeoutMs / 1000}s");
+            AppLog.Info("dns", $"Resolve {host} timed out after {timeoutMs / 1000}s");
             throw new TimeoutException($"Resolving {host} timed out after {timeoutMs / 1000}s");
         }
         catch (SocketException ex)
         {
-            Log.Debug($"resolve: {host} failed: {ex.Message}");
+            AppLog.Info("dns", $"Resolve {host} failed: {ex.Message}");
             throw;
         }
     }
@@ -144,7 +144,7 @@ static class Runner
             open = client.Connected;
         }
         catch { }
-        Log.Debug($"connect: {ip}:{port} {(open ? "open" : "closed or filtered")}");
+        AppLog.Debug("tcp", $"Connect {ip} port {port}: {(open ? "open" : "no answer")}");
         return open;
     }
 }

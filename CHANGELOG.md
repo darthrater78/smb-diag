@@ -7,6 +7,49 @@ All notable changes to this project are documented here. The format follows
 Releases up to 1.3.1 are listed in the README's Version History and on the
 [GitHub releases page](https://github.com/darthrater78/smb-diag/releases).
 
+## [1.5.0] - 2026-10-05
+
+### Added
+- Light and dark themes in Windows' own colours. The app starts in the Windows app
+  theme; the header button switches between **Dark mode** and the light theme,
+  **Flashbang**, and a choice made there is saved. The title bar and scrollbars
+  follow the theme.
+- A **Log** tab showing the in-memory log as it is written, with a **Debug** box,
+  **Copy log**, **Save log** and **Clear log**.
+- **Copy results** puts the report on the clipboard.
+- Pressing Enter in an input field starts a run.
+- The results list is exposed to screen readers as a list of rows (name, status,
+  detail).
+- `DESIGN.md` records the colours, type, layout and rules, shared with ad-diag.
+
+### Changed
+- Results are a grid: a status column whose marks differ by shape as well as colour
+  (circle passed, triangle warning, cross failed, dash skipped, ring running), the
+  test name, then the detail in plain text. Each group heading shows its count of
+  checks, failures and warnings.
+- During a run each row shows "Running" until its own group reports, instead of
+  every row reading "running..." until the whole run finished.
+- The log is always recorded in memory (it was off by default); only Debug detail is
+  optional. It is still never written to disk unless you save it. The header **Log**
+  link and its Off / On / Debug menu are replaced by the Log tab.
+- Buttons, tabs and labels use sentence case; the AD joined / Entra joined switch is
+  drawn as tabs.
+- The app is DPI-aware and scales its layout to the display.
+- Values use Cascadia Code and fall back to Consolas where it is not installed
+  (Windows 10 and Windows Server).
+- GitHub and Release Notes links open through Explorer, so the browser is not started
+  elevated when the app runs as Administrator.
+- Minimum window width is 760 px (was 660), so the status text beside the buttons stays readable.
+- Export failures are reported in the status line instead of crashing the handler.
+
+### Fixed
+- Shrinking the window until the results needed a scrollbar left a horizontal
+  scrollbar behind.
+- `&` was swallowed in group headings and details ("Identity _Device",
+  "refuse LM _NTLM").
+- A two-digit pass count overlapped the word "passed" in the summary bar.
+- A "Ticket Purge" row appeared while a run was in progress and then vanished.
+
 ## [1.4.0] - 2026-10-05
 
 ### Added
