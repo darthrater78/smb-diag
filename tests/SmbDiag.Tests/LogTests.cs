@@ -2,64 +2,113 @@ using Xunit;
 
 namespace SmbDiag.Tests;
 
+// Runner writes to the shared log, so tests that read it don't run alongside each other
 [CollectionDefinition("Log", DisableParallelization = true)]
 public class LogCollection { }
 
-// The log holds tool output, so what each level records, and that it stays in memory, is pinned here.
-[Collection("Log")]
-public class LogTests : IDisposable
+public class LogTests
 {
-    public LogTests() => Log.Clear();
+    static readonly DateTime At = new(2026, 10, 5, 14, 2, 3, 118);
+    static DiagLog NewLog(bool debug = false) => new(() => At) { DebugEnabled = debug };
+
+    [Fact]
+    public void DebugLines_AreRecordedOnlyWhileDebugIsOn_AndNotEvenBuiltOtherwise()
+    {
+        var log = NewLog();
+        log.Info("run", "Started");
+        log.Debug("tool", "raw output");
+        log.Debug("tool", () => throw new InvalidOperationException("built a message nobody asked for"));
+        Assert.Equal(["Started"], log.Since(0).Select(l => l.Message));
+
+        log.DebugEnabled = true;
+        log.Debug("tool", () => "raw output");
+        Assert.Equal([false, true], log.Since(0).Select(l => l.Debug));
+    }
+
+    [Fact]
+    public void Since_ReturnsOnlyNewerLines_AndClearDoesNotReuseNumbers()
+    {
+        var log = NewLog();
+        log.Info("run", "one");
+        log.Info("run", "two");
+        long last = log.Since(0)[^1].Seq;
+        Assert.Empty(log.Since(last));
+        log.Clear();
+        log.Info("run", "three");
+        Assert.Equal(["three"], log.Since(last).Select(l => l.Message));
+    }
+
+    [Fact]
+    public void Log_IsBounded_OldestLinesGoFirst_AndLongMessagesAreCut()
+    {
+        var log = NewLog();
+        for (int i = 0; i < DiagLog.MaxLines + 10; i++) log.Info("run", $"line {i}");
+        var lines = log.Since(0);
+        Assert.Equal(DiagLog.MaxLines, lines.Count);
+        Assert.Equal("line 10", lines[0].Message);
+
+        log.Info("tool", new string('x', DiagLog.MaxMessageChars + 500));
+        Assert.EndsWith("(500 more characters not logged)", log.Since(0)[^1].Message);
+    }
+
+    [Fact]
+    public void Text_IndentsContinuationLinesUnderTheMessage()
+    {
+        var log = NewLog(debug: true);
+        log.Info("run", "Started");
+        log.Debug("tool", "klist (12 ms)\r\nCached Tickets: (2)\r\n");
+        Assert.Equal(
+            "14:02:03.118  run     Started" + Environment.NewLine +
+            "14:02:03.118  tool    DEBUG klist (12 ms)\n" +
+            "                            Cached Tickets: (2)" + Environment.NewLine,
+            log.Text());
+    }
+}
+
+// What the shared log records about a tool: nothing of its output unless debug is on, and never a file
+[Collection("Log")]
+public class RunnerLogTests : IDisposable
+{
+    static readonly (string Path, string Args) Echo = OperatingSystem.IsWindows()
+        ? (Path.Combine(Environment.SystemDirectory, "cmd.exe"), "/c echo ticket-data")
+        : ("/bin/sh", "-c \"echo ticket-data\"");
+
+    public RunnerLogTests()
+    {
+        AppLog.DebugEnabled = false;
+        AppLog.Shared.Clear();
+    }
 
     public void Dispose()
     {
-        Log.Level = LogLevel.Off;
-        Log.Clear();
+        AppLog.DebugEnabled = false;
+        AppLog.Shared.Clear();
     }
 
     [Fact]
-    public void Off_RecordsNothing()
+    public void AToolsOutputIsLoggedOnlyInDebug()
     {
-        Log.Level = LogLevel.Off;
-        Log.Info("a"); Log.Debug("b"); Log.Error("c");
-        Assert.True(Log.IsEmpty);
-        Assert.Equal("", Log.Snapshot());
+        Runner.RunProcess(Echo.Path, Echo.Args, 10000);
+        Assert.DoesNotContain("ticket-data", AppLog.Shared.Text());
+
+        AppLog.DebugEnabled = true;
+        Runner.RunProcess(Echo.Path, Echo.Args, 10000);
+        string text = AppLog.Shared.Text();
+        Assert.Contains("exited 0", text);
+        Assert.Contains("ticket-data", text);
     }
 
     [Fact]
-    public void Normal_RecordsInfoAndErrorsButNotDebug()
+    public void ATimeoutIsLoggedEvenWithoutDebug()
     {
-        Log.Level = LogLevel.Normal;
-        Log.Info("run started");
-        Log.Debug("raw tool output");
-        Log.Error("failed", new InvalidOperationException("boom"));
-        string text = Log.Snapshot();
-        Assert.Contains("INFO ", text);
-        Assert.Contains("run started", text);
-        Assert.Contains("failed: InvalidOperationException: boom", text);
-        Assert.DoesNotContain("raw tool output", text);
+        var sleeper = OperatingSystem.IsWindows()
+            ? (Path: Path.Combine(Environment.SystemDirectory, "cmd.exe"), Args: "/c ping -n 30 127.0.0.1")
+            : (Path: "/bin/sh", Args: "-c \"exec sleep 30\"");
+        Assert.Throws<TimeoutException>(() => Runner.RunProcess(sleeper.Path, sleeper.Args, 300));
+        Assert.Contains("timed out after 0s", AppLog.Shared.Text());
     }
 
-    [Fact]
-    public void Debug_RecordsAToolsCommandAndOutput_NormalDoesNot()
-    {
-        (string path, string args) = OperatingSystem.IsWindows()
-            ? (Path.Combine(Environment.SystemDirectory, "cmd.exe"), "/c echo ticket-data")
-            : ("/bin/sh", "-c \"echo ticket-data\"");
-
-        Log.Level = LogLevel.Normal;
-        Runner.RunProcess(path, args, 10000);
-        Assert.DoesNotContain("ticket-data", Log.Snapshot());
-
-        Log.Level = LogLevel.Debug;
-        Runner.RunProcess(path, args, 10000);
-        string text = Log.Snapshot();
-        Assert.Contains("run: ", text);
-        Assert.Contains("exit 0", text);
-        Assert.Contains("    ticket-data", text); // output lines are indented under their entry
-    }
-
-    // The app's promise: logging never touches the disk by itself, whatever the level
+    // The app's promise: logging never touches the disk by itself
     [Fact]
     public void Logging_WritesNoFile()
     {
@@ -69,8 +118,9 @@ public class LogTests : IDisposable
         try
         {
             Directory.SetCurrentDirectory(dir);
-            Log.Level = LogLevel.Debug;
-            Log.Info("a"); Log.Debug("b"); Log.Error("c");
+            AppLog.DebugEnabled = true;
+            AppLog.Info("run", "a");
+            AppLog.Debug("tool", "b");
             Assert.Empty(Directory.GetFileSystemEntries(dir));
         }
         finally
@@ -78,38 +128,5 @@ public class LogTests : IDisposable
             Directory.SetCurrentDirectory(old);
             Directory.Delete(dir, recursive: true);
         }
-    }
-
-    [Fact]
-    public void LongEntriesAreTruncated()
-    {
-        Log.Level = LogLevel.Normal;
-        Log.Info(new string('x', Log.MaxEntryChars + 500));
-        Assert.Contains("truncated (500 more characters)", Log.Snapshot());
-        Assert.True(Log.Snapshot().Length < Log.MaxEntryChars + 1000);
-    }
-
-    [Fact]
-    public void OldestEntriesAreDroppedOnceTheLogIsFull()
-    {
-        Log.Level = LogLevel.Normal;
-        Log.Info("first entry");
-        string big = new('x', Log.MaxEntryChars);
-        for (int i = 0; i < Log.MaxTotalChars / Log.MaxEntryChars + 2; i++) Log.Info(big);
-        Log.Info("last entry");
-        string text = Log.Snapshot();
-        Assert.True(text.Length <= Log.MaxTotalChars + 1000, $"length {text.Length}");
-        Assert.DoesNotContain("first entry", text);
-        Assert.Contains("last entry", text);
-        Assert.Contains("older entries were dropped", text);
-    }
-
-    [Fact]
-    public void Clear_EmptiesTheLog()
-    {
-        Log.Level = LogLevel.Normal;
-        Log.Info("a");
-        Log.Clear();
-        Assert.True(Log.IsEmpty);
     }
 }

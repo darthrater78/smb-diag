@@ -35,6 +35,10 @@ static class Shots
         string outDir = args.Length > 0 ? args[0] : ".";
         CultureInfo.DefaultThreadCurrentCulture = CultureInfo.CurrentCulture = new CultureInfo("en-US");
 
+        // The app follows the Windows light/dark app setting; a second argument of "dark" selects it for this run
+        using (var personalize = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+            personalize.SetValue("AppsUseLightTheme", args.Length > 1 && args[1] == "dark" ? 0 : 1, Microsoft.Win32.RegistryValueKind.DWord);
+
         // Before the form exists: its constructor already runs dsregcmd to detect the scenario
         string fakeDir = Environment.GetEnvironmentVariable("SHOTS_FAKE_DIR")
             ?? throw new InvalidOperationException("SHOTS_FAKE_DIR is not set (run through run.sh)");
@@ -91,6 +95,41 @@ static class Shots
         SendMessage(tb.Handle, WM_VSCROLL, SB_TOP, IntPtr.Zero); // Wine ignores ScrollToCaret here
         Pump(500);
         Capture(form, outDir, "kerberos-tickets.png");
+
+        if (Environment.GetEnvironmentVariable("SHOTS_CHECK") == "1") CaptureChecks(form, outDir);
+    }
+
+    // Extra captures for a visual pass over the screens the README doesn't show (SHOTS_CHECK=1; see README.md here)
+    static void CaptureChecks(MainForm form, string outDir)
+    {
+        Call(form, "SwitchTab", "guide");
+        FrontFill(Get<RichTextBox>(form, "_guideBox"));
+        Pump(500);
+        Capture(form, outDir, "check-guide.png");
+
+        Get<CheckBox>(form, "_chkDebug").Checked = true;
+        var refresh = (Task)Call(form, "RefreshTicketsAsync")!;
+        var until = DateTime.Now.AddSeconds(20);
+        while (!refresh.IsCompleted && DateTime.Now < until) Pump(100);
+        Call(form, "SwitchTab", "log");
+        FrontFill(Get<Panel>(form, "_logPanel"));
+        Pump(800);
+        Capture(form, outDir, "check-log.png");
+
+        // A run in progress: one group reported, the rest still running, at the minimum window width
+        Call(form, "SwitchTab", "results");
+        var skeleton = (List<TestGroup>)typeof(MainForm).GetMethod("BuildSkeleton", BindingFlags.Static | BindingFlags.NonPublic)!.Invoke(null, [false])!;
+        skeleton[0] = new TestGroup(skeleton[0].Name,
+        [
+            new("Domain Join Type", Status.Pass, "DomainJoined: YES"),
+            new("Azure AD Join", Status.Warn, "AzureAdJoined: NO, and a detail long enough to wrap onto a second line at the minimum window width of the app"),
+            new("Logged-on User", Status.Fail, "No logon session"),
+            new("WHfB Status", Status.Skip, "Not applicable"),
+        ]);
+        Call(form, "RenderResults", skeleton);
+        form.Size = form.MinimumSize;
+        Pump(800);
+        Capture(form, outDir, "check-running-narrow.png");
     }
 
     static void FrontFill(Control fill)

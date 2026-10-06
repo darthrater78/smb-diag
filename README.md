@@ -4,9 +4,13 @@ Standalone Windows diagnostic tool that tests the full SMB/Kerberos authenticati
 
 ![Results for an AD-joined device](docs/screenshots/results-ad.png)
 
+The app follows the Windows light or dark app setting, and the header button switches between **Dark mode** and the light theme, **Flashbang**:
+
+![The same results in dark mode](docs/screenshots/results-dark.png)
+
 ## Download
 
-Grab `smb-diag.exe` from the [latest release](https://github.com/darthrater78/smb-diag/releases/latest). No installation — just run. Source: [github.com/darthrater78/smb-diag](https://github.com/darthrater78/smb-diag) · [v1.4.0 release notes](https://github.com/darthrater78/smb-diag/releases/tag/v1.4.0)
+Grab `smb-diag.exe` from the [latest release](https://github.com/darthrater78/smb-diag/releases/latest). No installation — just run. Source: [github.com/darthrater78/smb-diag](https://github.com/darthrater78/smb-diag) · [v1.5.0 release notes](https://github.com/darthrater78/smb-diag/releases/tag/v1.5.0)
 
 ## Windows SmartScreen
 
@@ -17,39 +21,44 @@ On first launch, Windows SmartScreen may display a warning ("Windows protected y
 1. Launch `smb-diag.exe`
 2. The app auto-detects your device join type (AD or Entra) on startup via `dsregcmd /status`
 3. Enter target details:
-   - **File Server** — hostname or FQDN (e.g. `files` or `files.contoso.com`). **+ domain suffix** is on by default, auto-appending the domain to short names. Uncheck to use the value as-is.
+   - **File server** — hostname or FQDN (e.g. `files` or `files.contoso.com`). **Add domain suffix** is on by default, auto-appending the domain to short names. Uncheck to use the value as-is.
    - **Domain** — e.g. `contoso.com`
-   - **DC Hostname** — optional, defaults to domain for KDC lookups. **+ domain suffix** is on by default, auto-appending the domain to short names. Uncheck to use the value as-is.
-   - **Share Path** — optional share name for access test (e.g. `shared$`)
-4. Click **Run Diagnostics** — results stream in as each test group completes
-5. Review results or switch to the **Guide** tab for explanations, or **Kerberos Tickets** tab for live ticket cache and PRT status
+   - **Domain controller** — optional, defaults to domain for KDC lookups. **Add domain suffix** is on by default, auto-appending the domain to short names. Uncheck to use the value as-is.
+   - **Share name** — optional share name for access test (e.g. `shared$`)
+4. Click **Run diagnostics** (or press Enter in a field) — each row shows a running ring until its test group reports, then its result
+5. Review results or switch to the **Guide** tab for explanations, the **Kerberos tickets** tab for live ticket cache and PRT status, or the **Log** tab for what the app did
 
-Input fields remember previously entered values in a dropdown. Up to 5 diagnostic runs are stored per scenario with timestamps — click any run to review it, or **Delete Run** to remove it.
+Input fields remember previously entered values in a dropdown. Up to 5 diagnostic runs are stored per scenario with timestamps — click any run to review it, or **Delete run** to remove it.
 
-- **Clear** — clears results and run history, keeps input fields and saved settings
-- **Reset** — clears everything including input fields and deletes the settings file
-- **Export Results** — saves a timestamped text report via Save dialog
+Every result has a status mark with its own shape as well as colour (circle passed, triangle warning, cross failed, dash skipped), and each group heading shows its count of checks, failures and warnings. The results list is exposed to screen readers as a list of rows.
 
-### Logging
+- **Export results** — saves a timestamped text report via Save dialog
+- **Copy results** — puts the same report on the clipboard
+- **Clear results** — clears results and run history, keeps input fields and saved settings
+- **Reset all** — clears everything including input fields and deletes the settings file
+- **Dark mode / Flashbang** — switches the theme. The app starts in the Windows app theme; once you use the button, your choice is saved
 
-Logging is **off by default**, and the log is **kept in memory only**: the app never writes it to disk by itself. The **Log** link in the header switches the level, and the level is remembered:
+### Log
 
-- **Off** — nothing is recorded.
-- **On** — each run's targets, every test result, timeouts, cancellations and errors.
-- **Debug** — everything in On, plus the command line, exit code, duration and raw output of every tool the app runs, and each DNS lookup and port probe.
+The **Log** tab shows what the app did: each run's targets, every test result, timeouts, cancellations and errors. It is **kept in memory only**: the app never writes it to disk by itself, and closing the app discards it.
 
-**Save log...** in the same menu writes the log to a file you choose; **Clear log** empties it. Closing the app discards whatever was not saved. The log holds at most about 8 million characters (the oldest entries are dropped first) and a single entry is cut at 64K characters. **Reset** turns logging off and discards the log.
+- **Debug** — when ticked, the log also records the command line, exit code, duration and raw output of every tool the app runs, and each DNS lookup and port probe. The setting is remembered.
+- **Copy log** — puts the log on the clipboard.
+- **Save log** — writes the log to a file you choose.
+- **Clear log** — empties it.
+
+The log holds the newest 5,000 entries, and a single entry is cut at 8,000 characters.
 
 ## Security
 
 ### No credentials are stored or transmitted
 
-This tool is **read-only and diagnostic**. It does not store, transmit, or log any credentials, tokens, or secrets. The optional log (off by default, see [Logging](#logging)) stays in memory unless you save it.
+This tool is **read-only and diagnostic**. It does not store, transmit, or log any credentials, tokens, or secrets. The log (see [Log](#log)) stays in memory unless you save it.
 
 - **SSPI token buffers are zeroed before freeing.** The Negotiate and NTLM token buffers allocated via `Marshal.AllocHGlobal` are explicitly cleared (`Span<byte>.Clear()`) before being freed, preventing auth tokens from lingering in heap memory.
 - **No credentials are written to disk.** The settings file (`%LOCALAPPDATA%\smb-diag\settings.json`) contains only input field history (hostnames) and scenario selection — never credentials, tokens, or ticket data.
 - **Exported reports contain only metadata.** The text export includes test names and diagnostic details (ticket names, expiry times, encryption types, port status). No raw tokens, password hashes, or credential material is included.
-- **External process output is not persisted.** Output from `dsregcmd`, `klist`, `cmdkey`, and other tools is parsed in memory for specific values only. The raw output is never written to disk by the app. With Debug logging on it is also held in the in-memory log, and reaches disk only if you choose **Save log...**.
+- **External process output is not persisted.** Output from `dsregcmd`, `klist`, `cmdkey`, and other tools is parsed in memory for specific values only. The raw output is never written to disk by the app. With **Debug** ticked on the Log tab it is also held in the in-memory log, and reaches disk only if you choose **Save log**.
 - **A saved Debug log holds raw tool output.** That means device and tenant IDs, account names, Kerberos ticket listings (names, times and encryption types, never keys) and the names of stored Credential Manager entries (never their passwords). SSPI tokens are never logged. Treat a saved log as you would an exported report before sharing it.
 - **`net use` connections are immediately cleaned up.** The Share Access Test creates a temporary connection and deletes it (`net use /delete`) immediately after the test.
 - **SSPI contexts are properly released.** `DeleteSecurityContext` and `FreeCredentialsHandle` are called in `finally` blocks to ensure native security handles are not leaked.
@@ -161,9 +170,9 @@ Tests connectivity to services required for SMB authentication. Port checks run 
 
 **Runtime:** .NET 8 WinForms, self-contained single-file executable (win-x64, ReadyToRun AOT, ~63 MB).
 
-**Structure:** Single-file app (`MainForm.cs`). All UI, diagnostics, and SSPI interop in one compilation unit.
+**Structure:** `MainForm.cs` holds the UI; `Diagnostics.cs` holds the test groups and the SSPI interop; `Runner.cs` holds everything that can block (tools, DNS, TCP), each with a deadline; `Log.cs` holds the in-memory log. The look is specified in [DESIGN.md](DESIGN.md).
 
-**UI:** Owner-drawn `Panel` with `TextRenderer.MeasureText` for word-wrapped results. Static GDI resources prevent handle leaks. Double-buffered rendering eliminates flicker. Dark theme. Test groups stream results in real-time as each completes.
+**UI:** Owner-drawn results grid with `TextRenderer.MeasureText` for word-wrapped details, double-buffered. Buttons and tabs are drawn by `ThemedButton` so they follow both themes. Light and dark themes use Windows 11 system colours; the title bar and scrollbars follow the theme. DPI-aware (system DPI). Cascadia Code for values, falling back to Consolas where it is not installed.
 
 **SSPI Interop:** Direct `secur32.dll` P/Invoke. All native memory (`Marshal.AllocHGlobal`) tracked before try blocks, zeroed, and freed in `finally` blocks.
 
@@ -171,7 +180,7 @@ Tests connectivity to services required for SMB authentication. Port checks run 
 - `HostnamePattern`: DNS label rules (letters, digits and `-`, 1–63 characters per label, no leading or trailing `-`, no empty labels) — server, domain, DC fields
 - `ShareNamePattern`: `^[a-zA-Z0-9_\-$.]+$` — share name field
 
-**Settings:** `%LOCALAPPDATA%\smb-diag\settings.json`. Contains input history and UI state only — no credentials. Persists across exe updates.
+**Settings:** `%LOCALAPPDATA%\smb-diag\settings.json`. Contains input history and UI state (scenario, suffix boxes, Debug logging, chosen theme) only — no credentials. Persists across exe updates.
 
 ### External Process Calls
 
@@ -212,6 +221,7 @@ The README screenshots are generated from mock data by `tools/screenshots/run.sh
 
 | Version | Date | Changes |
 |---|---|---|
+| v1.5.0 | 2026-10-05 | Native Windows look shared with ad-diag: light and dark themes (Dark mode / Flashbang button), results grid with status marks that differ by shape, per-group counts, DPI scaling, Consolas fallback; Log tab with Debug option replaces the header Log link; Copy results; Enter starts a run; results exposed to screen readers; fixed `&` in headings, pass count overlapping its label, and the Ticket Purge row that vanished |
 | v1.4.0 | 2026-10-05 | Optional logging (Off / On / Debug), kept in memory and saved only on request; the app now always exits when closed and never leaves tools running: every tool runs in a kill-on-close job, DNS, port probes and SSPI negotiation have deadlines, closing cancels the run; tool errors written to stderr are now shown; unit tests and docs-only CI skip added |
 | v1.3.2 | 2026-09-27 | Security hardening from audit: system tools launched by full System32 path (blocks exe planting beside smb-diag.exe), secur32.dll loaded from System32 only, stricter hostname validation (DNS label rules), settings load/save/reset failures reported instead of ignored; CI build, tag-triggered release workflow, workflow linting and Dependabot added |
 | v1.3.1 | 2026-07-16 | Fix crash when clicking Clear/Reset mid-run; fix stale "Pending..." history entries on cancelled runs; fix "running..." indicator turning off too early; fix klist Client field not parsing; fix WHfB duplicate entries on registry access failure; fix Open Share ignoring domain suffix; async Kerberos Tickets tab (no more UI freeze); drain stderr in RunProcess to prevent pipe-buffer deadlock; disable action buttons during diagnostic run to prevent data corruption; reentrancy guard on ticket refresh; extract shared suffix helper |

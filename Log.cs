@@ -1,95 +1,93 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 
 #nullable enable
 namespace SmbDiag;
 
-enum LogLevel { Off, Normal, Debug }
+record LogLine(long Seq, DateTime Time, bool Debug, string Source, string Message);
 
-// Optional log, off unless the user turns it on, and kept in memory only: the app never writes it to disk on
-// its own. The user can save it to a file they choose (MainForm's Log menu). Normal records what the app did
-// and what each test found; Debug adds every tool's command line and raw output. Kept free of any WinForms
-// dependency so it can be unit tested on any platform (see tests/SmbDiag.Tests).
-static class Log
+/// <summary>
+/// The app's log: what it did and what came back. Held in memory only (the app writes nothing to disk unless the
+/// user saves the log) and bounded, so the oldest lines go first. Debug lines, which carry raw tool output, are
+/// recorded only while <see cref="DebugEnabled"/> is on. Safe to call from any thread. Kept free of any WinForms
+/// dependency so it can be unit tested (see tests/SmbDiag.Tests).
+/// </summary>
+sealed class DiagLog(Func<DateTime>? clock = null)
 {
-    public const int MaxEntryChars = 64 * 1024;
-    public const int MaxTotalChars = 8 * 1024 * 1024;
+    public const int MaxLines = 5000;
+    public const int MaxMessageChars = 8000;
 
-    static readonly object Gate = new();
-    static readonly Queue<string> Entries = new();
-    static volatile LogLevel _level;
-    static int _totalChars, _dropped;
+    readonly Queue<LogLine> _lines = new();
+    readonly Func<DateTime> _clock = clock ?? (() => DateTime.Now);
+    long _seq;
+    volatile bool _debug;
 
-    public static LogLevel Level
+    public bool DebugEnabled { get => _debug; set => _debug = value; }
+
+    public void Info(string source, string message) => Add(false, source, message);
+
+    public void Debug(string source, string message)
     {
-        get => _level;
-        set => _level = value;
+        if (_debug) Add(true, source, message);
     }
 
-    public static bool DebugEnabled => _level == LogLevel.Debug;
-
-    public static bool IsEmpty
+    /// <summary>For messages that cost something to build: <paramref name="message"/> runs only when debug is on.</summary>
+    public void Debug(string source, Func<string> message)
     {
-        get { lock (Gate) return Entries.Count == 0; }
+        if (_debug) Add(true, source, message());
     }
 
-    public static void Info(string message)
+    void Add(bool debug, string source, string message)
     {
-        if (_level != LogLevel.Off) Add("INFO ", message);
-    }
-
-    public static void Debug(string message)
-    {
-        if (_level == LogLevel.Debug) Add("DEBUG", message);
-    }
-
-    public static void Error(string message, Exception? ex = null)
-    {
-        if (_level != LogLevel.Off) Add("ERROR", ex == null ? message : $"{message}: {ex.GetType().Name}: {ex.Message}");
-    }
-
-    /// <summary>Everything logged so far, oldest first, as the text a saved log file holds.</summary>
-    public static string Snapshot()
-    {
-        lock (Gate)
+        message = message.Replace("\r\n", "\n").TrimEnd();
+        if (message.Length > MaxMessageChars)
+            message = message[..MaxMessageChars] + $"\n... ({message.Length - MaxMessageChars} more characters not logged)";
+        lock (_lines)
         {
-            var sb = new StringBuilder(_totalChars + 128);
-            if (_dropped > 0)
-                sb.Append($"({_dropped} older entries were dropped to keep the log under {MaxTotalChars / (1024 * 1024)} million characters)")
-                    .Append(Environment.NewLine);
-            foreach (string entry in Entries) sb.Append(entry);
-            return sb.ToString();
+            _lines.Enqueue(new(++_seq, _clock(), debug, source, message));
+            while (_lines.Count > MaxLines) _lines.Dequeue();
         }
     }
 
-    public static void Clear()
+    /// <summary>Lines added after the one numbered <paramref name="seq"/> (0 for all of them), oldest first.</summary>
+    public List<LogLine> Since(long seq)
     {
-        lock (Gate)
-        {
-            Entries.Clear();
-            _totalChars = 0;
-            _dropped = 0;
-        }
+        lock (_lines) return _lines.Where(l => l.Seq > seq).ToList();
     }
 
-    static void Add(string level, string message)
+    public void Clear()
     {
-        if (message.Length > MaxEntryChars)
-            message = message[..MaxEntryChars] + $"\n... truncated ({message.Length - MaxEntryChars} more characters)";
-        // Continuation lines are indented so every entry still starts with a timestamp
-        string entry = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {level} [{Environment.CurrentManagedThreadId,3}] "
-            + message.TrimEnd().Replace("\r\n", "\n").Replace("\n", Environment.NewLine + "    ") + Environment.NewLine;
-        lock (Gate)
-        {
-            Entries.Enqueue(entry);
-            _totalChars += entry.Length;
-            // Oldest entries go first; the newest is always kept
-            while (_totalChars > MaxTotalChars && Entries.Count > 1)
-            {
-                _totalChars -= Entries.Dequeue().Length;
-                _dropped++;
-            }
-        }
+        lock (_lines) _lines.Clear();
     }
+
+    /// <summary>"14:02:03.118  dns     " — the fixed-width start of a line; continuation lines are indented to match.</summary>
+    public static string Prefix(LogLine line) => $"{line.Time:HH:mm:ss.fff}  {line.Source,-7} ";
+
+    public static string Body(LogLine line)
+    {
+        string text = (line.Debug ? "DEBUG " : "") + line.Message;
+        return text.Replace("\n", "\n" + new string(' ', Prefix(line).Length + (line.Debug ? 6 : 0)));
+    }
+
+    /// <summary>The whole log as plain text: what Save log writes and Copy log puts on the clipboard.</summary>
+    public string Text()
+    {
+        var sb = new StringBuilder();
+        foreach (var line in Since(0))
+            sb.Append(Prefix(line)).AppendLine(Body(line));
+        return sb.ToString();
+    }
+}
+
+/// <summary>The one log the app and <see cref="Runner"/> write to; the Log tab shows it.</summary>
+static class AppLog
+{
+    public static readonly DiagLog Shared = new();
+
+    public static bool DebugEnabled { get => Shared.DebugEnabled; set => Shared.DebugEnabled = value; }
+    public static void Info(string source, string message) => Shared.Info(source, message);
+    public static void Debug(string source, string message) => Shared.Debug(source, message);
+    public static void Debug(string source, Func<string> message) => Shared.Debug(source, message);
 }
